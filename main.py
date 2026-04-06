@@ -803,19 +803,101 @@ def sf_watch():
         return access_denied_html(err), 403
 
     file_code  = sf_file.get("file_code", "")
-    direct_url = (
-        f"https://savefiles.com/api/file/direct"
-        f"?key={SAVEFILES_API_KEY}&file_code={file_code}"
-    )
+    file_name  = sf_file.get("file_name", "Video")
+
+    # Use our own /sf/stream route as video source
+    # This proxies from SaveFiles so URL is always clean
+    u = request.args.get("u", "")
+    t = request.args.get("t", "")
+    stream_url = f"/sf/stream?id={unique_id}&u={u}&t={t}"
 
     resp = make_response(render_template_string(
         WATCH_HTML,
-        file_name  = sf_file.get("file_name", "Video"),
-        video_url  = direct_url,
+        file_name  = file_name,
+        video_url  = stream_url,
         view_count = sf_file.get("view_count", 0),
     ))
     resp.headers["Cache-Control"] = "private, max-age=300"
     return resp
+
+
+@flask_app.route("/sf/stream")
+def sf_stream():
+    """Proxy stream from SaveFiles — hides real URL, supports range requests."""
+    unique_id = request.args.get("id", "")
+    if not unique_id:
+        abort(400)
+
+    sf_file, err = verify_sf_access(unique_id)
+    if err:
+        abort(403)
+
+    file_code = sf_file.get("file_code", "")
+    file_name = sf_file.get("file_name", "video.mp4")
+    if not file_code:
+        abort(404)
+
+    # Get direct download URL from SaveFiles API
+    try:
+        info_resp = requests.get(
+            "https://savefiles.com/api/file/direct_link",
+            params={"key": SAVEFILES_API_KEY, "file_code": file_code},
+            timeout=10
+        )
+        if info_resp.status_code == 200:
+            data = info_resp.json()
+            if data.get("status") == 200:
+                result = data.get("result", {})
+                direct_url = result.get("url") or result.get("direct_link") or ""
+                if direct_url:
+                    return redirect(direct_url)
+
+    except Exception as e:
+        logger.error(f"SaveFiles direct link error: {e}")
+
+    # Fallback: proxy stream via our server
+    try:
+        range_header = request.headers.get("Range", "bytes=0-")
+        sf_resp = requests.get(
+            f"https://savefiles.com/d/{file_code}/{file_name}",
+            headers={"Range": range_header},
+            stream=True,
+            timeout=(5, 60)
+        )
+
+        ct = sf_resp.headers.get("Content-Type", "video/mp4")
+        if not ct.startswith("video/"):
+            ct = "video/mp4"
+
+        resp_headers = {
+            "Accept-Ranges":     "bytes",
+            "Content-Type":      ct,
+            "X-Accel-Buffering": "no",
+        }
+        if sf_resp.headers.get("Content-Length"):
+            resp_headers["Content-Length"] = sf_resp.headers["Content-Length"]
+        if sf_resp.headers.get("Content-Range"):
+            resp_headers["Content-Range"] = sf_resp.headers["Content-Range"]
+
+        def generate():
+            try:
+                for chunk in sf_resp.iter_content(chunk_size=512 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                sf_resp.close()
+
+        return Response(
+            generate(),
+            status=sf_resp.status_code,
+            headers=resp_headers,
+            content_type=ct,
+            direct_passthrough=True
+        )
+
+    except Exception as e:
+        logger.error(f"SaveFiles stream error: {e}")
+        abort(502)
 
 
 @flask_app.route("/verify/<int:user_id>")
