@@ -1,8 +1,8 @@
 """
 Telegram File Sharing + Streaming Bot
-SaveFiles.com Edition — Production Ready
+Streamtape Edition — Production Ready
 No Pyrogram, No Telethon, No Pixeldrain, No Catbox
-Pure SaveFiles.com streaming with premium HTML5 player
+Pure Streamtape.com streaming with premium HTML5 player
 """
 
 import os
@@ -57,10 +57,11 @@ BASE_URL           = os.environ.get("BASE_URL", "http://localhost:5000")
 FLASK_SECRET       = os.environ.get("FLASK_SECRET", uuid.uuid4().hex)
 PORT               = int(os.environ.get("PORT", "5000"))
 
-# SaveFiles (Primary & Only Storage)
-SAVEFILES_API_KEY  = os.environ.get("SAVEFILES_API_KEY", "")
-SF_BASE            = "https://savefiles.com/api"
-SF_UPLOAD_URL      = "https://savefiles.com/api"
+# Streamtape (Primary Storage)
+ST_LOGIN           = os.environ.get("STREAMTAPE_LOGIN", "")
+ST_KEY             = os.environ.get("STREAMTAPE_KEY", "")
+ST_BASE            = "https://api.streamtape.com"
+
 
 # Payment
 UPI_ID             = os.environ.get("UPI_ID", "yourname@upi")
@@ -128,7 +129,7 @@ db = mongo_client["filebot"]
 # Collections
 users_col     = db[f"users_bot{SERVER_ID}"]   # Per-bot registration
 access_col    = db["user_access"]              # SHARED: token + premium
-savefiles_col = db["savefiles"]               # SHARED: SaveFiles files
+streamtape_col = db["streamtape_files"]               # SHARED: Streamtape files
 payments_col  = db["payments"]                # SHARED: payments
 referrals_col = db["referrals"]               # SHARED: referrals
 
@@ -138,9 +139,9 @@ def setup_indexes():
     access_col.create_index("user_id", unique=True)
     access_col.create_index("token_expiry")
     access_col.create_index("premium_expiry")
-    savefiles_col.create_index("unique_id", unique=True)
-    savefiles_col.create_index("file_code")
-    savefiles_col.create_index("upload_time")
+    streamtape_col.create_index("unique_id", unique=True)
+    streamtape_col.create_index("video_id")
+    streamtape_col.create_index("upload_time")
     payments_col.create_index("utr")
     payments_col.create_index([("user_id", ASCENDING), ("status", ASCENDING)])
     referrals_col.create_index(
@@ -299,13 +300,13 @@ _file_cache: dict = {}
 _file_cache_lock = threading.Lock()
 
 
-def get_savefiles_file_cached(unique_id: str) -> dict | None:
+def get_st_file_cached(unique_id: str) -> dict | None:
     now = time.time()
     with _file_cache_lock:
         cached = _file_cache.get(unique_id)
         if cached and now - cached[1] < 300:
             return cached[0]
-    doc = savefiles_col.find_one({"unique_id": unique_id})
+    doc = streamtape_col.find_one({"unique_id": unique_id})
     if doc:
         with _file_cache_lock:
             _file_cache[unique_id] = (doc, now)
@@ -322,36 +323,36 @@ def invalidate_file_cache(unique_id: str):
 
 
 # ─────────────────────────────────────────────
-#  SAVEFILES API
+#  STREAMTAPE API
 # ─────────────────────────────────────────────
 
 # Persistent session for connection reuse
-_sf_session = requests.Session()
-_sf_adapter = requests.adapters.HTTPAdapter(
+_st_session = requests.Session()
+_st_adapter = requests.adapters.HTTPAdapter(
     pool_connections=20, pool_maxsize=20, max_retries=1
 )
-_sf_session.mount("https://", _sf_adapter)
+_st_session.mount("https://", _st_adapter)
 
 
-def upload_to_savefiles(file_bytes: bytes, filename: str, max_retries: int = 3) -> dict | None:
+def upload_to_streamtape(file_bytes: bytes, filename: str, max_retries: int = 3) -> dict | None:
     """
-    Upload to SaveFiles.com — Correct 2-step process:
-    Step 1: GET /api/upload/server → returns upload URL (e.g. https://s1.savefiles.com/upload/01)
+    Upload to Streamtape.com — Correct 2-step process:
+    Step 1: GET /file/ul → get upload URL → returns upload URL (e.g. upload server URL)
     Step 2: POST file to that upload URL with key param
     """
-    if not SAVEFILES_API_KEY:
-        logger.error("SAVEFILES_API_KEY not set!")
+    if not ST_KEY:
+        logger.error("ST_KEY not set!")
         return None
 
     for attempt in range(1, max_retries + 1):
         try:
             size_mb = len(file_bytes) / 1024 / 1024
-            logger.info(f"SaveFiles upload attempt {attempt}/{max_retries}: {filename} ({size_mb:.1f} MB)")
+            logger.info(f"Streamtape upload attempt {attempt}/{max_retries}: {filename} ({size_mb:.1f} MB)")
 
             # ── Step 1: Get upload server URL ─────────────
-            server_resp = _sf_session.get(
-                "https://savefiles.com/api/upload/server",
-                params={"key": SAVEFILES_API_KEY},
+            server_resp = _st_session.get(
+                "https://api.streamtape.com/file/ul",
+                params={"key": ST_KEY},
                 timeout=15
             )
             logger.info(f"Server URL response [{server_resp.status_code}]: {server_resp.text[:200]}")
@@ -360,7 +361,7 @@ def upload_to_savefiles(file_bytes: bytes, filename: str, max_retries: int = 3) 
             if server_resp.status_code == 200:
                 server_data = server_resp.json()
                 if server_data.get("status") == 200:
-                    # result is a string URL: "https://s1.savefiles.com/upload/01"
+                    # result is a string URL: "upload server URL"
                     result = server_data.get("result", "")
                     if isinstance(result, str) and result.startswith("http"):
                         upload_url = result
@@ -375,9 +376,9 @@ def upload_to_savefiles(file_bytes: bytes, filename: str, max_retries: int = 3) 
             logger.info(f"Upload URL: {upload_url}")
 
             # ── Step 2: Upload file to server ─────────────
-            # Append key as query param (SaveFiles format)
-            upload_resp = _sf_session.post(
-                f"{upload_url}?key={SAVEFILES_API_KEY}",
+            # Append key as query param
+            upload_resp = _st_session.post(
+                f"{upload_url}?key={ST_KEY}",
                 files={"file": (filename, io.BytesIO(file_bytes), "application/octet-stream")},
                 timeout=600
             )
@@ -402,41 +403,41 @@ def upload_to_savefiles(file_bytes: bytes, filename: str, max_retries: int = 3) 
                 if isinstance(data, list) and data:
                     data = data[0]
 
-                # Extract file_code from various formats
-                file_code = (
-                    data.get("file_code") or data.get("filecode") or
+                # Extract video_id from various formats
+                video_id = (
+                    data.get("video_id") or data.get("filecode") or
                     data.get("code") or data.get("hash")
                 )
                 url = (
                     data.get("url") or data.get("file_url") or
                     data.get("download_url") or
-                    (f"https://savefiles.com/{file_code}" if file_code else "")
+                    (f"https://streamtape.com/v/{video_id}" if video_id else "")
                 )
 
-                if file_code:
-                    logger.info(f"✅ SaveFiles upload success: {file_code}")
+                if video_id:
+                    logger.info(f"✅ Streamtape upload success: {video_id}")
                     return {
-                        "file_code":  file_code,
+                        "video_id":  video_id,
                         "url":        url,
-                        "stream_url": f"https://xvs.tt/{file_code}",
+                        "stream_url": f"https://xvs.tt/{video_id}",
                     }
 
-                logger.warning(f"No file_code in response: {data}")
+                logger.warning(f"No video_id in response: {data}")
 
         except requests.exceptions.Timeout:
-            logger.error(f"SaveFiles timeout attempt {attempt}")
+            logger.error(f"Streamtape timeout attempt {attempt}")
         except Exception as e:
-            logger.error(f"SaveFiles upload error: {e}")
+            logger.error(f"Streamtape upload error: {e}")
         time.sleep(3 * attempt)
     return None
 
 
-def savefiles_file_info(file_code: str) -> dict | None:
-    """Get file metadata from SaveFiles."""
+def streamtape_file_info(video_id: str) -> dict | None:
+    """Get file metadata from Streamtape."""
     try:
-        resp = _sf_session.get(
-            "https://savefiles.com/api/file/info",
-            params={"key": SAVEFILES_API_KEY, "file_code": file_code},
+        resp = _st_session.get(
+            "https://streamtape.com/v/api/file/info",
+            params={"key": ST_KEY, "video_id": video_id},
             timeout=15
         )
         logger.info(f"File info [{resp.status_code}]: {resp.text[:300]}")
@@ -451,20 +452,20 @@ def savefiles_file_info(file_code: str) -> dict | None:
                 # Return whole data if result is empty but status OK
                 return data
     except Exception as e:
-        logger.error(f"SaveFiles info error: {e}")
+        logger.error(f"Streamtape info error: {e}")
     return None
 
 
-def check_savefiles(file_code: str) -> bool:
-    return bool(savefiles_file_info(file_code))
+def check_streamtape(video_id: str) -> bool:
+    return bool(streamtape_file_info(video_id))
 
 
-def save_savefiles_file(unique_id: str, file_code: str, stream_url: str,
+def save_st_file(unique_id: str, video_id: str, stream_url: str,
                          file_name: str, file_size: int, file_type: str,
                          telegram_file_id: str = "") -> dict:
     doc = {
         "unique_id":         unique_id,
-        "file_code":         file_code,
+        "video_id":         video_id,
         "stream_url":        stream_url,
         "file_name":         file_name,
         "file_size":         file_size,
@@ -474,17 +475,17 @@ def save_savefiles_file(unique_id: str, file_code: str, stream_url: str,
         "view_count":        0,
         "last_checked":      datetime.utcnow(),
     }
-    savefiles_col.update_one(
+    streamtape_col.update_one(
         {"unique_id": unique_id},
         {"$set": doc},
         upsert=True
     )
-    logger.info(f"✅ SaveFiles saved: {file_name} | code: {file_code}")
+    logger.info(f"✅ Streamtape saved: {file_name} | code: {video_id}")
     return doc
 
 
-def make_sf_deep_link(unique_id: str) -> str:
-    return f"https://t.me/{BOT_USERNAME}?start=sf_{unique_id}"
+def make_st_deep_link(unique_id: str) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=st_{unique_id}"
 
 
 # ─────────────────────────────────────────────
@@ -747,18 +748,18 @@ WATCH_HTML = """<!DOCTYPE html>
 #  HMAC TOKEN FUNCTIONS
 # ─────────────────────────────────────────────
 
-def make_sf_token(user_id: int, unique_id: str) -> str:
+def make_st_token(user_id: int, unique_id: str) -> str:
     return hashlib.sha256(
         f"sf:{user_id}:{unique_id}:{FLASK_SECRET}".encode()
     ).hexdigest()[:16]
 
 
 def make_watch_url(user_id: int, unique_id: str) -> str:
-    t = make_sf_token(user_id, unique_id)
+    t = make_st_token(user_id, unique_id)
     return f"{BASE_URL}/sf/watch?id={unique_id}&u={user_id}&t={t}"
 
 
-def verify_sf_access(unique_id: str):
+def verify_st_access(unique_id: str):
     token       = request.args.get("t", "")
     user_id_raw = request.args.get("u", "")
     if not user_id_raw:
@@ -767,15 +768,15 @@ def verify_sf_access(unique_id: str):
         uid = int(user_id_raw)
     except ValueError:
         return None, "Bad user ID"
-    expected = make_sf_token(uid, unique_id)
+    expected = make_st_token(uid, unique_id)
     if token != expected:
         return None, "Invalid token"
     if not has_valid_token(uid):
         return None, "No valid token"
-    sf_file = get_savefiles_file_cached(unique_id)
-    if not sf_file:
+    st_file = get_st_file_cached(unique_id)
+    if not st_file:
         return None, "File not found"
-    return sf_file, None
+    return st_file, None
 
 
 def access_denied_html(err: str) -> str:
@@ -793,20 +794,20 @@ def access_denied_html(err: str) -> str:
 #  FLASK ROUTES
 # ─────────────────────────────────────────────
 
-@flask_app.route("/sf/watch")
-def sf_watch():
+@flask_app.route("/st/watch")
+def st_watch():
     unique_id = request.args.get("id", "")
     if not unique_id:
         abort(400)
-    sf_file, err = verify_sf_access(unique_id)
+    st_file, err = verify_st_access(unique_id)
     if err:
         return access_denied_html(err), 403
 
-    file_code  = sf_file.get("file_code", "")
-    file_name  = sf_file.get("file_name", "Video")
+    video_id  = st_file.get("video_id", "")
+    file_name  = st_file.get("file_name", "Video")
 
     # Use our own /sf/stream route as video source
-    # This proxies from SaveFiles so URL is always clean
+    # Proxy stream so real URL stays hidden
     u = request.args.get("u", "")
     t = request.args.get("t", "")
     stream_url = f"/sf/stream?id={unique_id}&u={u}&t={t}"
@@ -815,33 +816,33 @@ def sf_watch():
         WATCH_HTML,
         file_name  = file_name,
         video_url  = stream_url,
-        view_count = sf_file.get("view_count", 0),
+        view_count = st_file.get("view_count", 0),
     ))
     resp.headers["Cache-Control"] = "private, max-age=300"
     return resp
 
 
-@flask_app.route("/sf/stream")
-def sf_stream():
-    """Proxy stream from SaveFiles — hides real URL, supports range requests."""
+@flask_app.route("/st/stream")
+def st_stream():
+    """Proxy stream from Streamtape — hides real URL, supports range requests."""
     unique_id = request.args.get("id", "")
     if not unique_id:
         abort(400)
 
-    sf_file, err = verify_sf_access(unique_id)
+    st_file, err = verify_st_access(unique_id)
     if err:
         abort(403)
 
-    file_code = sf_file.get("file_code", "")
-    file_name = sf_file.get("file_name", "video.mp4")
-    if not file_code:
+    video_id = st_file.get("video_id", "")
+    file_name = st_file.get("file_name", "video.mp4")
+    if not video_id:
         abort(404)
 
-    # Get direct download URL from SaveFiles API
+    # Get direct download URL from Streamtape API
     try:
         info_resp = requests.get(
-            "https://savefiles.com/api/file/direct_link",
-            params={"key": SAVEFILES_API_KEY, "file_code": file_code},
+            "https://streamtape.com/v/api/file/direct_link",
+            params={"key": ST_KEY, "video_id": video_id},
             timeout=10
         )
         if info_resp.status_code == 200:
@@ -853,19 +854,19 @@ def sf_stream():
                     return redirect(direct_url)
 
     except Exception as e:
-        logger.error(f"SaveFiles direct link error: {e}")
+        logger.error(f"Streamtape direct link error: {e}")
 
     # Fallback: proxy stream via our server
     try:
         range_header = request.headers.get("Range", "bytes=0-")
-        sf_resp = requests.get(
-            f"https://savefiles.com/d/{file_code}/{file_name}",
+        st_resp = requests.get(
+            f"https://streamtape.com/v/d/{video_id}/{file_name}",
             headers={"Range": range_header},
             stream=True,
             timeout=(5, 60)
         )
 
-        ct = sf_resp.headers.get("Content-Type", "video/mp4")
+        ct = st_resp.headers.get("Content-Type", "video/mp4")
         if not ct.startswith("video/"):
             ct = "video/mp4"
 
@@ -874,29 +875,29 @@ def sf_stream():
             "Content-Type":      ct,
             "X-Accel-Buffering": "no",
         }
-        if sf_resp.headers.get("Content-Length"):
-            resp_headers["Content-Length"] = sf_resp.headers["Content-Length"]
-        if sf_resp.headers.get("Content-Range"):
-            resp_headers["Content-Range"] = sf_resp.headers["Content-Range"]
+        if st_resp.headers.get("Content-Length"):
+            resp_headers["Content-Length"] = st_resp.headers["Content-Length"]
+        if st_resp.headers.get("Content-Range"):
+            resp_headers["Content-Range"] = st_resp.headers["Content-Range"]
 
         def generate():
             try:
-                for chunk in sf_resp.iter_content(chunk_size=512 * 1024):
+                for chunk in st_resp.iter_content(chunk_size=512 * 1024):
                     if chunk:
                         yield chunk
             finally:
-                sf_resp.close()
+                st_resp.close()
 
         return Response(
             generate(),
-            status=sf_resp.status_code,
+            status=st_resp.status_code,
             headers=resp_headers,
             content_type=ct,
             direct_passthrough=True
         )
 
     except Exception as e:
-        logger.error(f"SaveFiles stream error: {e}")
+        logger.error(f"Streamtape stream error: {e}")
         abort(502)
 
 
@@ -925,15 +926,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     track_active_user(user.id)
 
-    # ── SaveFiles file request ────────────────
-    if payload.startswith("sf_"):
+    # ── Streamtape file request ─────────────────
+    if payload.startswith("st_"):
         unique_id   = payload[3:]
         is_new_user = users_col.find_one({"user_id": user.id}) is None
         if is_new_user and is_bot_full() and NEXT_BOT_LINK:
             await send_redirect_message(update, ctx, file_id=unique_id)
             return
         get_user(user.id)
-        await handle_sf_request(update, ctx, unique_id)
+        await handle_st_request(update, ctx, unique_id)
         return
 
     # ── Referral ──────────────────────────────
@@ -1031,7 +1032,7 @@ async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     next_name = f"@{NEXT_BOT_NAME}" if NEXT_BOT_NAME else "our sister bot"
 
     if file_id and NEXT_BOT_NAME:
-        deep_link = f"https://t.me/{NEXT_BOT_NAME}?start=sf_{file_id}"
+        deep_link = f"https://t.me/{NEXT_BOT_NAME}?start=st_{file_id}"
         text = (
             f"👋 <b>Hello {user.first_name}!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1061,12 +1062,12 @@ async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-async def handle_sf_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, unique_id: str):
-    """Serve SaveFiles file to user."""
+async def handle_st_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, unique_id: str):
+    """Serve Streamtape file to user."""
     user    = update.effective_user
-    sf_file = get_savefiles_file_cached(unique_id)
+    st_file = get_st_file_cached(unique_id)
 
-    if not sf_file:
+    if not st_file:
         await update.message.reply_text(
             "❌ <b>File not found!</b>\n\nThis link may be invalid.",
             parse_mode="HTML"
@@ -1077,35 +1078,35 @@ async def handle_sf_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uniq
         await send_verification_prompt(update, ctx, unique_id)
         return
 
-    file_type = sf_file.get("file_type", "document")
-    file_name = sf_file.get("file_name", "file")
-    file_code = sf_file.get("file_code", "")
-    file_size = sf_file.get("file_size", 0)
+    file_type = st_file.get("file_type", "document")
+    file_name = st_file.get("file_name", "file")
+    video_id = st_file.get("video_id", "")
+    file_size = st_file.get("file_size", 0)
     size_mb   = file_size / 1024 / 1024 if file_size else 0
 
     # Auto re-check Pixeldrain (once per hour)
-    last_checked = sf_file.get("last_checked")
+    last_checked = st_file.get("last_checked")
     if last_checked and (datetime.utcnow() - last_checked).total_seconds() > 3600:
-        if not check_savefiles(file_code):
-            tg_fid = sf_file.get("telegram_file_id", "")
+        if not check_streamtape(video_id):
+            tg_fid = st_file.get("telegram_file_id", "")
             if tg_fid:
                 msg = await update.message.reply_text("🔄 Re-uploading file...")
                 try:
                     file_obj   = await ctx.bot.get_file(tg_fid)
                     file_bytes = bytes(await file_obj.download_as_bytearray())
                     result = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: upload_to_savefiles(file_bytes, file_name)
+                        None, lambda: upload_to_streamtape(file_bytes, file_name)
                     )
                     if result:
-                        savefiles_col.update_one(
+                        streamtape_col.update_one(
                             {"unique_id": unique_id},
                             {"$set": {
-                                "file_code":    result["file_code"],
+                                "video_id":    result["video_id"],
                                 "stream_url":   result["stream_url"],
                                 "last_checked": datetime.utcnow(),
                             }}
                         )
-                        file_code = result["file_code"]
+                        video_id = result["video_id"]
                         invalidate_file_cache(unique_id)
                         await msg.delete()
                     else:
@@ -1121,14 +1122,14 @@ async def handle_sf_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uniq
                     parse_mode="HTML"
                 )
                 return
-        savefiles_col.update_one(
+        streamtape_col.update_one(
             {"unique_id": unique_id},
             {"$set": {"last_checked": datetime.utcnow()}}
         )
 
     # Increment views
-    savefiles_col.update_one({"unique_id": unique_id}, {"$inc": {"view_count": 1}})
-    views = sf_file.get("view_count", 0) + 1
+    streamtape_col.update_one({"unique_id": unique_id}, {"$inc": {"view_count": 1}})
+    views = st_file.get("view_count", 0) + 1
 
     if file_type == "video":
         watch_url = make_watch_url(user.id, unique_id)
@@ -1148,7 +1149,7 @@ async def handle_sf_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uniq
             reply_markup=kb
         )
     else:
-        stream_url = sf_file.get("stream_url", "")
+        stream_url = st_file.get("stream_url", "")
         await update.message.reply_text(
             f"📁 <b>{file_name}</b>\n\n"
             f"📦 Size: {size_mb:.1f} MB\n\n"
@@ -1521,7 +1522,7 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         ]}
     })
-    total_files   = savefiles_col.count_documents({})
+    total_files   = streamtape_col.count_documents({})
     pending_pay   = payments_col.count_documents({"status": "pending"})
     total_refs    = referrals_col.count_documents({})
     concurrent    = get_concurrent_users()
@@ -1552,14 +1553,14 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def sffiles_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    files = list(savefiles_col.find().sort("upload_time", -1).limit(10))
+async def stfiles_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    files = list(streamtape_col.find().sort("upload_time", -1).limit(10))
     if not files:
         await update.message.reply_text("No files uploaded yet.")
         return
     lines = ["📁 <b>Last 10 Files:</b>\n"]
     for f in files:
-        link    = make_sf_deep_link(f["unique_id"])
+        link    = make_st_deep_link(f["unique_id"])
         size_mb = (f.get("file_size", 0) or 0) / 1024 / 1024
         views   = f.get("view_count", 0)
         lines.append(
@@ -1575,63 +1576,63 @@ async def sffiles_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def sfadd_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Add large file by SaveFiles file code: /sfadd FILE_CODE name.mp4"""
+async def stadd_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Add large file by Streamtape video ID: /stadd VIDEO_ID name.mp4"""
     args = ctx.args
     if not args:
         await update.message.reply_text(
             "📋 <b>Usage:</b>\n"
             "<code>/sfadd FILE_CODE filename.mp4</code>\n\n"
             "<b>Steps for large files (&gt;20MB):</b>\n"
-            "┣ 1️⃣ Upload to savefiles.com manually\n"
+            "┣ 1️⃣ Upload to streamtape.com manually\n"
             "┣ 2️⃣ Copy file code from URL\n"
             "┗ 3️⃣ Send: <code>/sfadd CODE filename.mp4</code>",
             parse_mode="HTML"
         )
         return
 
-    file_code = args[0].strip()
-    file_name = " ".join(args[1:]).strip() if len(args) > 1 else f"file_{file_code}"
+    video_id = args[0].strip()
+    file_name = " ".join(args[1:]).strip() if len(args) > 1 else f"file_{video_id}"
     file_type = (
         "video" if any(file_name.lower().endswith(e)
                        for e in [".mp4", ".mkv", ".webm", ".avi", ".mov"])
         else "document"
     )
 
-    msg = await update.message.reply_text("🔍 Verifying on SaveFiles...")
+    msg = await update.message.reply_text("🔍 Verifying on Streamtape...")
 
-    info = savefiles_file_info(file_code)
+    info = streamtape_file_info(video_id)
     if not info:
         await msg.edit_text(
             f"❌ <b>File not found!</b>\n\n"
-            f"Code: <code>{file_code}</code>\n"
-            f"Make sure it's uploaded to savefiles.com",
+            f"Code: <code>{video_id}</code>\n"
+            f"Make sure it's uploaded to streamtape.com",
             parse_mode="HTML"
         )
         return
 
     file_size  = int(info.get("size", 0))
     size_mb    = file_size / 1024 / 1024 if file_size else 0
-    stream_url = f"https://xvs.tt/{file_code}"
+    stream_url = f"https://xvs.tt/{video_id}"
     unique_id  = uuid.uuid4().hex[:16]
 
-    save_savefiles_file(
+    save_st_file(
         unique_id  = unique_id,
-        file_code  = file_code,
+        video_id  = video_id,
         stream_url = stream_url,
         file_name  = file_name,
         file_size  = file_size,
         file_type  = file_type,
     )
 
-    deep_link = make_sf_deep_link(unique_id)
+    deep_link = make_st_deep_link(unique_id)
 
     await msg.edit_text(
         f"✅ <b>File Added!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📁 <b>Name:</b> <code>{file_name}</code>\n"
         f"📦 <b>Size:</b> {size_mb:.1f} MB\n"
-        f"🆔 <b>Code:</b> <code>{file_code}</code>\n\n"
+        f"🆔 <b>Code:</b> <code>{video_id}</code>\n\n"
         f"🔗 <b>Universal Share Link:</b>\n"
         f"<code>{deep_link}</code>\n\n"
         f"✅ This ONE link works on ALL bots!",
@@ -1662,7 +1663,7 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin uploads file → SaveFiles → Universal link."""
+    """Admin uploads file → Streamtape → Universal link."""
     msg       = update.message
     user      = update.effective_user
     tg_file   = None
@@ -1694,7 +1695,7 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📏 Bot API limit: 20 MB\n\n"
             f"✅ <b>Use this instead:</b>\n"
-            f"┣ 1️⃣ Upload to savefiles.com manually\n"
+            f"┣ 1️⃣ Upload to streamtape.com manually\n"
             f"┣ 2️⃣ Copy the file code from URL\n"
             f"┗ 3️⃣ Send: <code>/sfadd FILE_CODE {file_name}</code>",
             parse_mode="HTML"
@@ -1715,23 +1716,23 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file_obj   = await ctx.bot.get_file(tg_file.file_id)
         file_bytes = bytes(await file_obj.download_as_bytearray())
 
-        await processing.edit_text(f"☁️ Uploading to SaveFiles.com...")
+        await processing.edit_text(f"☁️ Uploading to Streamtape.com...")
         result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: upload_to_savefiles(file_bytes, file_name)
+            None, lambda: upload_to_streamtape(file_bytes, file_name)
         )
 
         if not result:
             await processing.edit_text(
-                "❌ <b>SaveFiles upload failed!</b>\n\n"
-                "Please check SAVEFILES_API_KEY or try again.",
+                "❌ <b>Streamtape upload failed!</b>\n\n"
+                "Please check ST_KEY or try again.",
                 parse_mode="HTML"
             )
             return
 
         unique_id = uuid.uuid4().hex[:16]
-        save_savefiles_file(
+        save_st_file(
             unique_id        = unique_id,
-            file_code        = result["file_code"],
+            video_id        = result["video_id"],
             stream_url       = result["stream_url"],
             file_name        = file_name,
             file_size        = file_size,
@@ -1739,7 +1740,7 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             telegram_file_id = tg_file.file_id,
         )
 
-        deep_link = make_sf_deep_link(unique_id)
+        deep_link = make_st_deep_link(unique_id)
 
         # Delete original message
         try:
@@ -1752,14 +1753,14 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📁 <b>Name:</b> <code>{file_name}</code>\n"
             f"📦 <b>Size:</b> {size_mb:.1f} MB\n"
-            f"🆔 <b>Code:</b> <code>{result['file_code']}</code>\n\n"
+            f"🆔 <b>Code:</b> <code>{result['video_id']}</code>\n\n"
             f"🔗 <b>Universal Share Link:</b>\n"
             f"<code>{deep_link}</code>\n\n"
             f"✅ This ONE link works on ALL bots!\n"
             f"📌 Share only this link — nothing else needed.",
             parse_mode="HTML"
         )
-        logger.info(f"Admin {user.id} uploaded: {file_name} → {result['file_code']}")
+        logger.info(f"Admin {user.id} uploaded: {file_name} → {result['video_id']}")
 
     except Exception as e:
         logger.error(f"Upload error: {e}")
@@ -1785,8 +1786,8 @@ def build_application() -> Application:
 
     # Admin
     app.add_handler(CommandHandler("stats",          stats_cmd))
-    app.add_handler(CommandHandler("sffiles",        sffiles_cmd))
-    app.add_handler(CommandHandler("sfadd",          sfadd_cmd))
+    app.add_handler(CommandHandler("stfiles",        stfiles_cmd))
+    app.add_handler(CommandHandler("stadd",          stadd_cmd))
     app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
     app.add_handler(CommandHandler("approve",        approve_cmd))
     app.add_handler(CommandHandler("reject",         reject_cmd))
@@ -1859,13 +1860,13 @@ def webhook():
 def main():
     global _bot_loop
 
-    logger.info("🚀 Starting FileBot (SaveFiles Edition)")
+    logger.info("🚀 Starting FileBot (Streamtape Edition)")
 
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not set!")
         return
-    if not SAVEFILES_API_KEY:
-        logger.warning("⚠️  SAVEFILES_API_KEY not set — uploads will fail!")
+    if not ST_KEY:
+        logger.warning("⚠️  ST_KEY not set — uploads will fail!")
     if not ADMIN_IDS:
         logger.warning("⚠️  No ADMIN_IDS set!")
 
