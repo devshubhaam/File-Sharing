@@ -1,12 +1,10 @@
 """
-Telegram File Sharing + Streaming Bot
-Streamtape Edition — Production Ready
-No Pyrogram, No Telethon, No Pixeldrain, No Catbox
-Pure Streamtape.com streaming with premium HTML5 player
+Telegram File Sharing Bot — Direct Send Edition
+No external storage. Pure Telegram file_id system.
+Admin uploads → Bot saves file_id → Users get file directly in Telegram
 """
 
 import os
-import io
 import re
 import uuid
 import hashlib
@@ -19,13 +17,8 @@ import urllib.parse
 from datetime import datetime, timedelta
 from functools import wraps
 
-from flask import (
-    Flask, request, jsonify, Response,
-    render_template_string, abort, make_response, redirect
-)
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-)
+from flask import Flask, request, jsonify, abort, redirect
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
@@ -57,12 +50,6 @@ BASE_URL           = os.environ.get("BASE_URL", "http://localhost:5000")
 FLASK_SECRET       = os.environ.get("FLASK_SECRET", uuid.uuid4().hex)
 PORT               = int(os.environ.get("PORT", "5000"))
 
-# Streamtape (Primary Storage)
-ST_LOGIN           = os.environ.get("STREAMTAPE_LOGIN", "")
-ST_KEY             = os.environ.get("STREAMTAPE_KEY", "")
-ST_BASE            = "https://api.streamtape.com"
-
-
 # Payment
 UPI_ID             = os.environ.get("UPI_ID", "yourname@upi")
 UPI_QR_URL         = os.environ.get("UPI_QR_URL", "")
@@ -75,13 +62,16 @@ NEXT_BOT_NAME      = NEXT_BOT_RAW.split("|")[0] if "|" in NEXT_BOT_RAW else ""
 NEXT_BOT_LINK      = NEXT_BOT_RAW.split("|")[1] if "|" in NEXT_BOT_RAW else ""
 
 # Token & Shortener
-TOKEN_VALIDITY_HOURS = int(os.environ.get("TOKEN_VALIDITY_HOURS", "24"))
-SHORTENER_API_KEY  = os.environ.get("SHORTENER_API_KEY", "")
-SHORTENER_DOMAIN   = os.environ.get("SHORTENER_DOMAIN", "api.shrtco.de")
+TOKEN_VALIDITY_HOURS  = int(os.environ.get("TOKEN_VALIDITY_HOURS", "24"))
+SHORTENER_API_KEY     = os.environ.get("SHORTENER_API_KEY", "")
+SHORTENER_DOMAIN      = os.environ.get("SHORTENER_DOMAIN", "api.shrtco.de")
 
-# Referral rewards
+# Referral
 REFERRAL_REWARD_HOURS  = int(os.environ.get("REFERRAL_REWARD_HOURS", "6"))
 REFERRAL_PREMIUM_COUNT = int(os.environ.get("REFERRAL_PREMIUM_COUNT", "10"))
+
+# Storage channel (optional — for permanent file_id)
+STORAGE_CHANNEL_ID = os.environ.get("STORAGE_CHANNEL_ID", "")
 
 # Premium plans
 PREMIUM_PLANS = {
@@ -102,36 +92,31 @@ def track_active_user(user_id: int):
     with _active_lock:
         _active_users[user_id] = time.time()
         cutoff = time.time() - 300
-        expired = [k for k, v in _active_users.items() if v < cutoff]
-        for k in expired:
+        for k in [k for k, v in _active_users.items() if v < cutoff]:
             _active_users.pop(k, None)
 
 
 def get_concurrent_users() -> int:
     with _active_lock:
-        cutoff = time.time() - 300
-        return sum(1 for t in _active_users.values() if t >= cutoff)
+        return sum(1 for t in _active_users.values() if t >= time.time() - 300)
 
 
 # ─────────────────────────────────────────────
-#  MONGODB SETUP
+#  MONGODB
 # ─────────────────────────────────────────────
 mongo_client = MongoClient(
     MONGO_URI,
     serverSelectionTimeoutMS=5000,
-    maxPoolSize=50,
-    minPoolSize=5,
-    retryWrites=True,
-    retryReads=True,
+    maxPoolSize=50, minPoolSize=5,
+    retryWrites=True, retryReads=True,
 )
 db = mongo_client["filebot"]
 
-# Collections
-users_col     = db[f"users_bot{SERVER_ID}"]   # Per-bot registration
-access_col    = db["user_access"]              # SHARED: token + premium
-streamtape_col = db["streamtape_files"]               # SHARED: Streamtape files
-payments_col  = db["payments"]                # SHARED: payments
-referrals_col = db["referrals"]               # SHARED: referrals
+users_col    = db[f"users_bot{SERVER_ID}"]
+access_col   = db["user_access"]
+files_col    = db["tg_files"]
+payments_col = db["payments"]
+referrals_col= db["referrals"]
 
 
 def setup_indexes():
@@ -139,16 +124,16 @@ def setup_indexes():
     access_col.create_index("user_id", unique=True)
     access_col.create_index("token_expiry")
     access_col.create_index("premium_expiry")
-    streamtape_col.create_index("unique_id", unique=True)
-    streamtape_col.create_index("video_id")
-    streamtape_col.create_index("upload_time")
+    files_col.create_index("unique_id", unique=True)
+    files_col.create_index("file_id")
+    files_col.create_index("upload_time")
     payments_col.create_index("utr")
     payments_col.create_index([("user_id", ASCENDING), ("status", ASCENDING)])
     referrals_col.create_index(
         [("referrer_id", ASCENDING), ("referred_user_id", ASCENDING)],
         unique=True
     )
-    logger.info(f"✅ MongoDB indexes created | Collection: users_bot{SERVER_ID}")
+    logger.info(f"✅ MongoDB ready | Collection: users_bot{SERVER_ID}")
 
 
 setup_indexes()
@@ -160,12 +145,8 @@ setup_indexes()
 def get_user(user_id: int) -> dict:
     user = users_col.find_one({"user_id": user_id})
     if not user:
-        user = {
-            "user_id":         user_id,
-            "referrals_count": 0,
-            "referred_by":     None,
-            "joined_at":       datetime.utcnow(),
-        }
+        user = {"user_id": user_id, "referrals_count": 0,
+                "referred_by": None, "joined_at": datetime.utcnow()}
         users_col.insert_one(user)
     return user
 
@@ -173,18 +154,13 @@ def get_user(user_id: int) -> dict:
 def get_access(user_id: int) -> dict:
     access = access_col.find_one({"user_id": user_id})
     if not access:
-        access = {
-            "user_id":        user_id,
-            "token_expiry":   None,
-            "premium_expiry": None,
-        }
+        access = {"user_id": user_id, "token_expiry": None, "premium_expiry": None}
         access_col.insert_one(access)
     return access
 
 
 def is_premium(user_id: int) -> bool:
-    access = get_access(user_id)
-    exp = access.get("premium_expiry")
+    exp = get_access(user_id).get("premium_expiry")
     return exp is not None and exp > datetime.utcnow()
 
 
@@ -199,25 +175,21 @@ def grant_token(user_id: int, hours: int = TOKEN_VALIDITY_HOURS):
 
 def grant_premium(user_id: int, days: int):
     access = get_access(user_id)
-    base = access.get("premium_expiry") or datetime.utcnow()
+    base   = access.get("premium_expiry") or datetime.utcnow()
     if base < datetime.utcnow():
         base = datetime.utcnow()
-    new_expiry = base + timedelta(days=days)
+    expiry = base + timedelta(days=days)
     access_col.update_one(
         {"user_id": user_id},
-        {"$set": {"premium_expiry": new_expiry}},
+        {"$set": {"premium_expiry": expiry}},
         upsert=True
     )
     invalidate_token_cache(user_id)
-    return new_expiry
+    return expiry
 
 
 def revoke_premium(user_id: int):
-    access_col.update_one(
-        {"user_id": user_id},
-        {"$set": {"premium_expiry": None}},
-        upsert=True
-    )
+    access_col.update_one({"user_id": user_id}, {"$set": {"premium_expiry": None}}, upsert=True)
     invalidate_token_cache(user_id)
 
 
@@ -230,22 +202,17 @@ def record_referral(referrer_id: int, referred_id: int) -> bool:
         return False
     try:
         referrals_col.insert_one({
-            "referrer_id":      referrer_id,
-            "referred_user_id": referred_id,
-            "timestamp":        datetime.utcnow()
+            "referrer_id": referrer_id, "referred_user_id": referred_id,
+            "timestamp": datetime.utcnow()
         })
-        users_col.update_one(
-            {"user_id": referrer_id},
-            {"$inc": {"referrals_count": 1}}
-        )
+        users_col.update_one({"user_id": referrer_id}, {"$inc": {"referrals_count": 1}})
         return True
     except DuplicateKeyError:
         return False
 
 
 def check_referral_rewards(referrer_id: int) -> str:
-    user = get_user(referrer_id)
-    count = user.get("referrals_count", 0)
+    count = get_user(referrer_id).get("referrals_count", 0)
     if count % 5 == 0:
         grant_token(referrer_id, hours=REFERRAL_REWARD_HOURS * (count // 5))
     if count >= REFERRAL_PREMIUM_COUNT and not is_premium(referrer_id):
@@ -258,7 +225,7 @@ def check_referral_rewards(referrer_id: int) -> str:
 #  TOKEN CACHE
 # ─────────────────────────────────────────────
 _token_cache: dict = {}
-_token_cache_lock = threading.Lock()
+_token_cache_lock  = threading.Lock()
 
 
 def has_valid_token(user_id: int) -> bool:
@@ -267,24 +234,20 @@ def has_valid_token(user_id: int) -> bool:
     now = datetime.utcnow()
     with _token_cache_lock:
         cached = _token_cache.get(user_id)
-        if cached:
-            result, cache_until = cached
-            if now < cache_until:
-                return result
+        if cached and now < cached[1]:
+            return cached[0]
     result = _check_token_db(user_id)
     with _token_cache_lock:
         _token_cache[user_id] = (result, now + timedelta(seconds=60))
         if len(_token_cache) > 10000:
             cutoff = now - timedelta(minutes=5)
-            expired = [k for k, v in _token_cache.items() if v[1] < cutoff]
-            for k in expired:
+            for k in [k for k, v in _token_cache.items() if v[1] < cutoff]:
                 _token_cache.pop(k, None)
     return result
 
 
 def _check_token_db(user_id: int) -> bool:
-    access = get_access(user_id)
-    exp = access.get("token_expiry")
+    exp = get_access(user_id).get("token_expiry")
     return exp is not None and exp > datetime.utcnow()
 
 
@@ -294,198 +257,31 @@ def invalidate_token_cache(user_id: int):
 
 
 # ─────────────────────────────────────────────
-#  FILE DOC CACHE
-# ─────────────────────────────────────────────
-_file_cache: dict = {}
-_file_cache_lock = threading.Lock()
-
-
-def get_st_file_cached(unique_id: str) -> dict | None:
-    now = time.time()
-    with _file_cache_lock:
-        cached = _file_cache.get(unique_id)
-        if cached and now - cached[1] < 300:
-            return cached[0]
-    doc = streamtape_col.find_one({"unique_id": unique_id})
-    if doc:
-        with _file_cache_lock:
-            _file_cache[unique_id] = (doc, now)
-            if len(_file_cache) > 500:
-                oldest = sorted(_file_cache.items(), key=lambda x: x[1][1])[:100]
-                for k, _ in oldest:
-                    _file_cache.pop(k, None)
-    return doc
-
-
-def invalidate_file_cache(unique_id: str):
-    with _file_cache_lock:
-        _file_cache.pop(unique_id, None)
-
-
-# ─────────────────────────────────────────────
-#  STREAMTAPE API
+#  FILE HELPERS
 # ─────────────────────────────────────────────
 
-# Persistent session for connection reuse
-_st_session = requests.Session()
-_st_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=20, pool_maxsize=20, max_retries=1
-)
-_st_session.mount("https://", _st_adapter)
-
-
-def upload_to_streamtape(file_bytes: bytes, filename: str, max_retries: int = 3) -> dict | None:
-    """
-    Upload to Streamtape.com — Correct 2-step process:
-    Step 1: GET /file/ul → get upload URL → returns upload URL (e.g. upload server URL)
-    Step 2: POST file to that upload URL with key param
-    """
-    if not ST_KEY:
-        logger.error("ST_KEY not set!")
-        return None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            size_mb = len(file_bytes) / 1024 / 1024
-            logger.info(f"Streamtape upload attempt {attempt}/{max_retries}: {filename} ({size_mb:.1f} MB)")
-
-            # ── Step 1: Get upload server URL ─────────────
-            server_resp = _st_session.get(
-                "https://api.streamtape.com/file/ul",
-                params={"key": ST_KEY},
-                timeout=15
-            )
-            logger.info(f"Server URL response [{server_resp.status_code}]: {server_resp.text[:200]}")
-
-            upload_url = None
-            if server_resp.status_code == 200:
-                server_data = server_resp.json()
-                if server_data.get("status") == 200:
-                    # result is a string URL: "upload server URL"
-                    result = server_data.get("result", "")
-                    if isinstance(result, str) and result.startswith("http"):
-                        upload_url = result
-                    elif isinstance(result, dict):
-                        upload_url = result.get("url") or result.get("upload_url")
-
-            if not upload_url:
-                logger.error("Could not get upload server URL")
-                time.sleep(3 * attempt)
-                continue
-
-            logger.info(f"Upload URL: {upload_url}")
-
-            # ── Step 2: Upload file to server ─────────────
-            # Append key as query param
-            upload_resp = _st_session.post(
-                f"{upload_url}?key={ST_KEY}",
-                files={"file": (filename, io.BytesIO(file_bytes), "application/octet-stream")},
-                timeout=600
-            )
-
-            logger.info(f"Upload response [{upload_resp.status_code}]: {upload_resp.text[:500]}")
-
-            if upload_resp.status_code == 200:
-                try:
-                    data = upload_resp.json()
-                except Exception:
-                    # Try parsing as list (some APIs return [{...}])
-                    try:
-                        import json
-                        data = json.loads(upload_resp.text)
-                        if isinstance(data, list) and data:
-                            data = data[0]
-                    except Exception:
-                        logger.warning(f"Non-JSON response: {upload_resp.text[:200]}")
-                        continue
-
-                # Handle list response
-                if isinstance(data, list) and data:
-                    data = data[0]
-
-                # Extract video_id from various formats
-                video_id = (
-                    data.get("video_id") or data.get("filecode") or
-                    data.get("code") or data.get("hash")
-                )
-                url = (
-                    data.get("url") or data.get("file_url") or
-                    data.get("download_url") or
-                    (f"https://streamtape.com/v/{video_id}" if video_id else "")
-                )
-
-                if video_id:
-                    logger.info(f"✅ Streamtape upload success: {video_id}")
-                    return {
-                        "video_id":  video_id,
-                        "url":        url,
-                        "stream_url": f"https://xvs.tt/{video_id}",
-                    }
-
-                logger.warning(f"No video_id in response: {data}")
-
-        except requests.exceptions.Timeout:
-            logger.error(f"Streamtape timeout attempt {attempt}")
-        except Exception as e:
-            logger.error(f"Streamtape upload error: {e}")
-        time.sleep(3 * attempt)
-    return None
-
-
-def streamtape_file_info(video_id: str) -> dict | None:
-    """Get file metadata from Streamtape."""
-    try:
-        resp = _st_session.get(
-            "https://streamtape.com/v/api/file/info",
-            params={"key": ST_KEY, "video_id": video_id},
-            timeout=15
-        )
-        logger.info(f"File info [{resp.status_code}]: {resp.text[:300]}")
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") == 200 and data.get("msg") == "OK":
-                result = data.get("result")
-                if isinstance(result, list) and result:
-                    return result[0]
-                if isinstance(result, dict):
-                    return result
-                # Return whole data if result is empty but status OK
-                return data
-    except Exception as e:
-        logger.error(f"Streamtape info error: {e}")
-    return None
-
-
-def check_streamtape(video_id: str) -> bool:
-    return bool(streamtape_file_info(video_id))
-
-
-def save_st_file(unique_id: str, video_id: str, stream_url: str,
-                         file_name: str, file_size: int, file_type: str,
-                         telegram_file_id: str = "") -> dict:
+def save_file(unique_id: str, file_id: str, file_name: str,
+              file_size: int, file_type: str) -> dict:
     doc = {
-        "unique_id":         unique_id,
-        "video_id":         video_id,
-        "stream_url":        stream_url,
-        "file_name":         file_name,
-        "file_size":         file_size,
-        "file_type":         file_type,
-        "telegram_file_id":  telegram_file_id,
-        "upload_time":       datetime.utcnow(),
-        "view_count":        0,
-        "last_checked":      datetime.utcnow(),
+        "unique_id":  unique_id,
+        "file_id":    file_id,
+        "file_name":  file_name,
+        "file_size":  file_size,
+        "file_type":  file_type,
+        "upload_time": datetime.utcnow(),
+        "view_count": 0,
     }
-    streamtape_col.update_one(
-        {"unique_id": unique_id},
-        {"$set": doc},
-        upsert=True
-    )
-    logger.info(f"✅ Streamtape saved: {file_name} | code: {video_id}")
+    files_col.update_one({"unique_id": unique_id}, {"$set": doc}, upsert=True)
+    logger.info(f"✅ File saved: {file_name} | unique_id: {unique_id}")
     return doc
 
 
-def make_st_deep_link(unique_id: str) -> str:
-    return f"https://t.me/{BOT_USERNAME}?start=st_{unique_id}"
+def get_file(unique_id: str) -> dict | None:
+    return files_col.find_one({"unique_id": unique_id})
+
+
+def make_deep_link(unique_id: str) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=file_{unique_id}"
 
 
 # ─────────────────────────────────────────────
@@ -501,8 +297,8 @@ def shorten_url(long_url: str) -> str:
             )
             if resp.status_code == 200:
                 return resp.json()["result"]["full_short_link"]
-        except Exception as e:
-            logger.warning(f"shrtco.de failed: {e}")
+        except Exception:
+            pass
         return long_url
     try:
         resp = requests.get(
@@ -512,8 +308,8 @@ def shorten_url(long_url: str) -> str:
         if resp.status_code == 200:
             data = resp.json()
             return data.get("shortenedUrl") or data.get("short_link") or long_url
-    except Exception as e:
-        logger.warning(f"Shortener failed: {e}")
+    except Exception:
+        pass
     return long_url
 
 
@@ -532,373 +328,10 @@ def admin_only(func):
 
 
 # ─────────────────────────────────────────────
-#  FLASK APP + WATCH HTML
+#  FLASK
 # ─────────────────────────────────────────────
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
-
-WATCH_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{ file_name }}</title>
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    :root {
-      --bg: #0a0a0f; --surface: #12121a; --card: #1a1a27;
-      --border: #ffffff12; --accent: #6c63ff; --accent2: #ff6584;
-      --text: #e8e8f0; --muted: #6b6b80; --glow: rgba(108,99,255,0.35);
-    }
-    html, body { height: 100%; background: var(--bg); color: var(--text);
-      font-family: 'Inter', sans-serif; overflow-x: hidden; }
-    body::before { content: ''; position: fixed; inset: 0;
-      background:
-        radial-gradient(ellipse 80% 50% at 20% 10%, rgba(108,99,255,0.12) 0%, transparent 60%),
-        radial-gradient(ellipse 60% 40% at 80% 90%, rgba(255,101,132,0.08) 0%, transparent 60%);
-      pointer-events: none; z-index: 0; }
-    .page { position: relative; z-index: 1; min-height: 100vh;
-      display: flex; flex-direction: column; align-items: center; padding: 24px 16px 40px; }
-    .topbar { width: 100%; max-width: 820px; display: flex;
-      align-items: center; justify-content: space-between; margin-bottom: 28px; }
-    .logo { display: flex; align-items: center; gap: 10px; text-decoration: none; }
-    .logo-icon { width: 36px; height: 36px;
-      background: linear-gradient(135deg, var(--accent), var(--accent2));
-      border-radius: 10px; display: flex; align-items: center;
-      justify-content: center; font-size: 18px; box-shadow: 0 0 16px var(--glow); }
-    .logo-text { font-size: 1rem; font-weight: 700;
-      background: linear-gradient(90deg, var(--accent), var(--accent2));
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .badge { background: linear-gradient(135deg, var(--accent), var(--accent2));
-      color: #fff; font-size: 0.7rem; font-weight: 600; padding: 4px 10px;
-      border-radius: 20px; letter-spacing: 0.5px; text-transform: uppercase; }
-    .player-card { width: 100%; max-width: 820px; background: var(--card);
-      border: 1px solid var(--border); border-radius: 20px; overflow: hidden;
-      box-shadow: 0 0 0 1px var(--border), 0 20px 60px rgba(0,0,0,0.6),
-        0 0 80px rgba(108,99,255,0.08); }
-    .video-wrap { position: relative; width: 100%; background: #000; }
-    video { width: 100%; display: block; max-height: 480px; background: #000; }
-    .video-wrap::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0;
-      height: 4px; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
-    .info { padding: 20px 24px 16px; border-bottom: 1px solid var(--border); }
-    .file-title { font-size: 1.05rem; font-weight: 600; color: var(--text);
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-meta { margin-top: 6px; font-size: 0.78rem; color: var(--muted);
-      display: flex; gap: 16px; flex-wrap: wrap; }
-    .stats { margin: 0 24px 20px; padding: 14px 18px; background: var(--surface);
-      border: 1px solid var(--border); border-radius: 12px;
-      display: flex; gap: 24px; flex-wrap: wrap; }
-    .stat { display: flex; flex-direction: column; gap: 2px; }
-    .stat-label { font-size: 0.68rem; color: var(--muted);
-      text-transform: uppercase; letter-spacing: 0.8px; font-weight: 500; }
-    .stat-value { font-size: 0.88rem; font-weight: 600; color: var(--text); }
-    .stat-value.accent { color: var(--accent); }
-    .actions { padding: 16px 24px 20px; display: flex; gap: 12px; flex-wrap: wrap; }
-    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px;
-      border-radius: 10px; font-size: 0.85rem; font-weight: 600;
-      text-decoration: none; cursor: pointer; border: none; transition: all 0.2s ease; }
-    .btn-primary { background: linear-gradient(135deg, var(--accent), #8b7cf8);
-      color: #fff; box-shadow: 0 4px 16px rgba(108,99,255,0.35); }
-    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 24px rgba(108,99,255,0.5); }
-    .btn-ghost { background: var(--surface); color: var(--text);
-      border: 1px solid var(--border); }
-    .btn-ghost:hover { background: var(--card); border-color: var(--accent); color: var(--accent); }
-    .loader { display: none; position: absolute; inset: 0;
-      background: rgba(10,10,15,0.85); align-items: center;
-      justify-content: center; flex-direction: column; gap: 16px; z-index: 10; }
-    .spinner { width: 44px; height: 44px; border: 3px solid var(--border);
-      border-top-color: var(--accent); border-radius: 50%;
-      animation: spin 0.8s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .loader-text { font-size: 0.85rem; color: var(--muted); }
-    .footer { margin-top: 28px; text-align: center; font-size: 0.75rem;
-      color: var(--muted); line-height: 1.7; }
-    @media (max-width: 600px) {
-      .page { padding: 16px 12px 32px; }
-      .topbar { margin-bottom: 16px; }
-      .info { padding: 16px 16px 12px; }
-      .actions { padding: 12px 16px 16px; gap: 8px; }
-      .stats { margin: 0 16px 16px; gap: 16px; }
-      video { max-height: 240px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <div class="topbar">
-      <a class="logo" href="#">
-        <div class="logo-icon">🎬</div>
-        <span class="logo-text">FileBot</span>
-      </a>
-      <span class="badge">Premium Stream</span>
-    </div>
-    <div class="player-card">
-      <div class="video-wrap">
-        <div class="loader" id="loader">
-          <div class="spinner"></div>
-          <span class="loader-text">Loading stream...</span>
-        </div>
-        <video id="player" controls autoplay preload="metadata" playsinline>
-          <source src="{{ video_url }}" type="video/mp4">
-          <source src="{{ video_url }}" type="video/webm">
-          Your browser does not support HTML5 video.
-        </video>
-      </div>
-      <div class="info">
-        <div class="file-title">{{ file_name }}</div>
-        <div class="file-meta">
-          <span>🔒 Secured Stream</span>
-          <span>⚡ Direct CDN</span>
-          <span>♾️ Always Available</span>
-        </div>
-      </div>
-      <div class="stats">
-        <div class="stat">
-          <span class="stat-label">Status</span>
-          <span class="stat-value accent" id="stat-status">Connecting...</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Duration</span>
-          <span class="stat-value" id="stat-duration">--:--</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Resolution</span>
-          <span class="stat-value" id="stat-res">--</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Buffered</span>
-          <span class="stat-value" id="stat-buf">0%</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Views</span>
-          <span class="stat-value accent">{{ view_count }}</span>
-        </div>
-      </div>
-      <div class="actions">
-        <a class="btn btn-primary" href="{{ video_url }}" download="{{ file_name }}">⬇️ Download</a>
-        <button class="btn btn-ghost" onclick="toggleFullscreen()">⛶ Fullscreen</button>
-        <button class="btn btn-ghost" onclick="copyLink()">🔗 Copy Link</button>
-      </div>
-    </div>
-    <div class="footer">
-      Powered by <strong>FileBot</strong> · Secure Streaming<br>
-      🔒 Your access is protected &amp; encrypted
-    </div>
-  </div>
-  <script>
-    const video = document.getElementById('player');
-    const loader = document.getElementById('loader');
-    video.addEventListener('waiting', () => { loader.style.display = 'flex'; });
-    video.addEventListener('playing', () => {
-      loader.style.display = 'none';
-      document.getElementById('stat-status').textContent = '▶ Playing';
-      document.getElementById('stat-status').style.color = '#4ade80';
-    });
-    video.addEventListener('pause', () => {
-      document.getElementById('stat-status').textContent = '⏸ Paused';
-      document.getElementById('stat-status').style.color = '#facc15';
-    });
-    video.addEventListener('error', () => {
-      loader.style.display = 'none';
-      document.getElementById('stat-status').textContent = '✗ Error';
-      document.getElementById('stat-status').style.color = '#f87171';
-    });
-    video.addEventListener('loadedmetadata', () => {
-      const d = video.duration;
-      if (isFinite(d)) {
-        const m = Math.floor(d / 60), s = Math.floor(d % 60).toString().padStart(2, '0');
-        document.getElementById('stat-duration').textContent = m + ':' + s;
-      }
-      if (video.videoWidth)
-        document.getElementById('stat-res').textContent = video.videoWidth + '×' + video.videoHeight;
-      loader.style.display = 'none';
-    });
-    setInterval(() => {
-      if (video.buffered.length > 0 && video.duration) {
-        const pct = Math.round((video.buffered.end(video.buffered.length - 1) / video.duration) * 100);
-        document.getElementById('stat-buf').textContent = pct + '%';
-      }
-    }, 1000);
-    function toggleFullscreen() {
-      document.fullscreenElement ? document.exitFullscreen() :
-        video.requestFullscreen().catch(() => video.webkitEnterFullscreen && video.webkitEnterFullscreen());
-    }
-    function copyLink() {
-      navigator.clipboard.writeText(window.location.href).then(() => {
-        const btn = event.target;
-        btn.textContent = '✅ Copied!';
-        setTimeout(() => btn.textContent = '🔗 Copy Link', 2000);
-      });
-    }
-    document.addEventListener('keydown', e => {
-      if (e.code === 'Space') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
-      if (e.code === 'ArrowRight') video.currentTime += 10;
-      if (e.code === 'ArrowLeft') video.currentTime -= 10;
-      if (e.code === 'ArrowUp') video.volume = Math.min(1, video.volume + 0.1);
-      if (e.code === 'ArrowDown') video.volume = Math.max(0, video.volume - 0.1);
-      if (e.code === 'KeyF') toggleFullscreen();
-    });
-  </script>
-</body>
-</html>"""
-
-
-# ─────────────────────────────────────────────
-#  HMAC TOKEN FUNCTIONS
-# ─────────────────────────────────────────────
-
-def make_st_token(user_id: int, unique_id: str) -> str:
-    return hashlib.sha256(
-        f"sf:{user_id}:{unique_id}:{FLASK_SECRET}".encode()
-    ).hexdigest()[:16]
-
-
-def make_watch_url(user_id: int, unique_id: str) -> str:
-    t = make_st_token(user_id, unique_id)
-    return f"{BASE_URL}/sf/watch?id={unique_id}&u={user_id}&t={t}"
-
-
-def verify_st_access(unique_id: str):
-    token       = request.args.get("t", "")
-    user_id_raw = request.args.get("u", "")
-    if not user_id_raw:
-        return None, "Missing auth"
-    try:
-        uid = int(user_id_raw)
-    except ValueError:
-        return None, "Bad user ID"
-    expected = make_st_token(uid, unique_id)
-    if token != expected:
-        return None, "Invalid token"
-    if not has_valid_token(uid):
-        return None, "No valid token"
-    st_file = get_st_file_cached(unique_id)
-    if not st_file:
-        return None, "File not found"
-    return st_file, None
-
-
-def access_denied_html(err: str) -> str:
-    return f"""<html><body style="background:#0a0a0f;color:#e8e8f0;
-    font-family:Inter,sans-serif;display:flex;align-items:center;
-    justify-content:center;height:100vh;flex-direction:column;gap:16px">
-    <div style="font-size:48px">🔒</div>
-    <h2 style="color:#f87171">Access Denied</h2>
-    <p style="color:#6b6b80">{err}</p>
-    <p style="color:#6b6b80;font-size:0.85rem">Open the file link via Telegram bot</p>
-    </body></html>"""
-
-
-# ─────────────────────────────────────────────
-#  FLASK ROUTES
-# ─────────────────────────────────────────────
-
-@flask_app.route("/st/watch")
-def st_watch():
-    unique_id = request.args.get("id", "")
-    if not unique_id:
-        abort(400)
-    st_file, err = verify_st_access(unique_id)
-    if err:
-        return access_denied_html(err), 403
-
-    video_id  = st_file.get("video_id", "")
-    file_name  = st_file.get("file_name", "Video")
-
-    # Use our own /sf/stream route as video source
-    # Proxy stream so real URL stays hidden
-    u = request.args.get("u", "")
-    t = request.args.get("t", "")
-    stream_url = f"/sf/stream?id={unique_id}&u={u}&t={t}"
-
-    resp = make_response(render_template_string(
-        WATCH_HTML,
-        file_name  = file_name,
-        video_url  = stream_url,
-        view_count = st_file.get("view_count", 0),
-    ))
-    resp.headers["Cache-Control"] = "private, max-age=300"
-    return resp
-
-
-@flask_app.route("/st/stream")
-def st_stream():
-    """Proxy stream from Streamtape — hides real URL, supports range requests."""
-    unique_id = request.args.get("id", "")
-    if not unique_id:
-        abort(400)
-
-    st_file, err = verify_st_access(unique_id)
-    if err:
-        abort(403)
-
-    video_id = st_file.get("video_id", "")
-    file_name = st_file.get("file_name", "video.mp4")
-    if not video_id:
-        abort(404)
-
-    # Get direct download URL from Streamtape API
-    try:
-        info_resp = requests.get(
-            "https://streamtape.com/v/api/file/direct_link",
-            params={"key": ST_KEY, "video_id": video_id},
-            timeout=10
-        )
-        if info_resp.status_code == 200:
-            data = info_resp.json()
-            if data.get("status") == 200:
-                result = data.get("result", {})
-                direct_url = result.get("url") or result.get("direct_link") or ""
-                if direct_url:
-                    return redirect(direct_url)
-
-    except Exception as e:
-        logger.error(f"Streamtape direct link error: {e}")
-
-    # Fallback: proxy stream via our server
-    try:
-        range_header = request.headers.get("Range", "bytes=0-")
-        st_resp = requests.get(
-            f"https://streamtape.com/v/d/{video_id}/{file_name}",
-            headers={"Range": range_header},
-            stream=True,
-            timeout=(5, 60)
-        )
-
-        ct = st_resp.headers.get("Content-Type", "video/mp4")
-        if not ct.startswith("video/"):
-            ct = "video/mp4"
-
-        resp_headers = {
-            "Accept-Ranges":     "bytes",
-            "Content-Type":      ct,
-            "X-Accel-Buffering": "no",
-        }
-        if st_resp.headers.get("Content-Length"):
-            resp_headers["Content-Length"] = st_resp.headers["Content-Length"]
-        if st_resp.headers.get("Content-Range"):
-            resp_headers["Content-Range"] = st_resp.headers["Content-Range"]
-
-        def generate():
-            try:
-                for chunk in st_resp.iter_content(chunk_size=512 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
-                st_resp.close()
-
-        return Response(
-            generate(),
-            status=st_resp.status_code,
-            headers=resp_headers,
-            content_type=ct,
-            direct_passthrough=True
-        )
-
-    except Exception as e:
-        logger.error(f"Streamtape stream error: {e}")
-        abort(502)
 
 
 @flask_app.route("/verify/<int:user_id>")
@@ -913,7 +346,7 @@ def health():
 
 @flask_app.route("/")
 def index():
-    return f"<h2>🎬 FileBot</h2><p>Use @{BOT_USERNAME} on Telegram</p>"
+    return f"<h2>🤖 FileBot</h2><p>Use @{BOT_USERNAME} on Telegram</p>"
 
 
 # ─────────────────────────────────────────────
@@ -926,15 +359,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     track_active_user(user.id)
 
-    # ── Streamtape file request ─────────────────
-    if payload.startswith("st_"):
-        unique_id   = payload[3:]
+    # ── File request ─────────────────────────
+    if payload.startswith("file_"):
+        unique_id   = payload[5:]
         is_new_user = users_col.find_one({"user_id": user.id}) is None
         if is_new_user and is_bot_full() and NEXT_BOT_LINK:
             await send_redirect_message(update, ctx, file_id=unique_id)
             return
         get_user(user.id)
-        await handle_st_request(update, ctx, unique_id)
+        await handle_file_request(update, ctx, unique_id)
         return
 
     # ── Referral ──────────────────────────────
@@ -949,15 +382,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if record_referral(referrer_id, user.id):
                 reward = check_referral_rewards(referrer_id)
                 try:
-                    reward_msg = (
-                        "🏆 You earned 7-day Premium!" if reward == "premium"
-                        else "⏰ You earned bonus token hours!"
-                    )
+                    rm = "🏆 You earned 7-day Premium!" if reward == "premium" else "⏰ You earned bonus token hours!"
                     await ctx.bot.send_message(
                         referrer_id,
                         f"🎉 <b>New Referral!</b>\n\n"
-                        f"User <code>{user.id}</code> joined via your link!\n"
-                        f"{reward_msg}",
+                        f"User joined via your link!\n{rm}",
                         parse_mode="HTML"
                     )
                 except Exception:
@@ -988,7 +417,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             pass
 
-    # ── New user redirect if bot full ─────────
+    # ── New user — redirect if full ───────────
     is_new_user = users_col.find_one({"user_id": user.id}) is None
     if is_new_user and is_bot_full() and NEXT_BOT_LINK:
         await send_redirect_message(update, ctx)
@@ -1004,27 +433,27 @@ async def send_welcome(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_users = users_col.count_documents({})
     concurrent  = get_concurrent_users()
 
-    text = (
+    await update.message.reply_text(
         f"👋 <b>Welcome, {user.first_name}!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎬 <b>File Sharing Bot</b> — Server {SERVER_ID}\n\n"
+        f"🤖 <b>File Sharing Bot</b> — Server {SERVER_ID}\n\n"
         f"📌 <b>Commands:</b>\n"
         f"┣ 💎 /premium — Get premium access\n"
         f"┣ 👥 /referral — Your referral link\n"
-        f"┗ 📊 /mystatus — Token & premium status\n\n"
+        f"┗ 📊 /mystatus — Token &amp; premium status\n\n"
         f"🔗 <b>Your Referral Link:</b>\n"
         f"<code>{ref_link}</code>\n\n"
         f"🎁 Refer friends &amp; earn free premium!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🟢 Server {SERVER_ID}  •  "
         f"👤 {total_users}/{MAX_USERS}  •  "
-        f"⚡ {concurrent} active"
+        f"⚡ {concurrent} active",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💎 Get Premium", callback_data="premium_menu"),
+            InlineKeyboardButton("📤 Share", url=f"https://t.me/share/url?url={urllib.parse.quote(ref_link)}")
+        ]])
     )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💎 Get Premium", callback_data="premium_menu"),
-        InlineKeyboardButton("📤 Share", url=f"https://t.me/share/url?url={urllib.parse.quote(ref_link)}")
-    ]])
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, file_id: str = ""):
@@ -1032,7 +461,7 @@ async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     next_name = f"@{NEXT_BOT_NAME}" if NEXT_BOT_NAME else "our sister bot"
 
     if file_id and NEXT_BOT_NAME:
-        deep_link = f"https://t.me/{NEXT_BOT_NAME}?start=st_{file_id}"
+        deep_link = f"https://t.me/{NEXT_BOT_NAME}?start=file_{file_id}"
         text = (
             f"👋 <b>Hello {user.first_name}!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1042,9 +471,7 @@ async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 Sister bot: <b>{next_name}</b>"
         )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Get My File Now", url=deep_link)
-        ]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Get My File Now", url=deep_link)]])
     else:
         text = (
             f"👋 <b>Hello {user.first_name}!</b>\n"
@@ -1055,115 +482,89 @@ async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 <b>{next_name}</b>"
         )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➡️ Join Sister Bot", url=NEXT_BOT_LINK)
-        ]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➡️ Join Sister Bot", url=NEXT_BOT_LINK)]])
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-async def handle_st_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, unique_id: str):
-    """Serve Streamtape file to user."""
+async def handle_file_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, unique_id: str):
+    """Send file directly to user via Telegram file_id."""
     user    = update.effective_user
-    st_file = get_st_file_cached(unique_id)
+    tg_file = get_file(unique_id)
 
-    if not st_file:
+    if not tg_file:
         await update.message.reply_text(
             "❌ <b>File not found!</b>\n\nThis link may be invalid.",
             parse_mode="HTML"
         )
         return
 
+    # Check token
     if not has_valid_token(user.id):
         await send_verification_prompt(update, ctx, unique_id)
         return
 
-    file_type = st_file.get("file_type", "document")
-    file_name = st_file.get("file_name", "file")
-    video_id = st_file.get("video_id", "")
-    file_size = st_file.get("file_size", 0)
+    file_id   = tg_file["file_id"]
+    file_name = tg_file.get("file_name", "file")
+    file_type = tg_file.get("file_type", "document")
+    file_size = tg_file.get("file_size", 0)
     size_mb   = file_size / 1024 / 1024 if file_size else 0
 
-    # Auto re-check Pixeldrain (once per hour)
-    last_checked = st_file.get("last_checked")
-    if last_checked and (datetime.utcnow() - last_checked).total_seconds() > 3600:
-        if not check_streamtape(video_id):
-            tg_fid = st_file.get("telegram_file_id", "")
-            if tg_fid:
-                msg = await update.message.reply_text("🔄 Re-uploading file...")
-                try:
-                    file_obj   = await ctx.bot.get_file(tg_fid)
-                    file_bytes = bytes(await file_obj.download_as_bytearray())
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: upload_to_streamtape(file_bytes, file_name)
-                    )
-                    if result:
-                        streamtape_col.update_one(
-                            {"unique_id": unique_id},
-                            {"$set": {
-                                "video_id":    result["video_id"],
-                                "stream_url":   result["stream_url"],
-                                "last_checked": datetime.utcnow(),
-                            }}
-                        )
-                        video_id = result["video_id"]
-                        invalidate_file_cache(unique_id)
-                        await msg.delete()
-                    else:
-                        await msg.edit_text("❌ File unavailable. Contact admin.")
-                        return
-                except Exception as e:
-                    logger.error(f"Re-upload error: {e}")
-                    await msg.edit_text("❌ File unavailable. Contact admin.")
-                    return
-            else:
-                await update.message.reply_text(
-                    "❌ <b>File unavailable!</b>\n\nContact admin to re-upload.",
-                    parse_mode="HTML"
-                )
-                return
-        streamtape_col.update_one(
-            {"unique_id": unique_id},
-            {"$set": {"last_checked": datetime.utcnow()}}
-        )
+    # Track views
+    files_col.update_one({"unique_id": unique_id}, {"$inc": {"view_count": 1}})
+    views = tg_file.get("view_count", 0) + 1
 
-    # Increment views
-    streamtape_col.update_one({"unique_id": unique_id}, {"$inc": {"view_count": 1}})
-    views = st_file.get("view_count", 0) + 1
+    msg = await update.message.reply_text("⏳ Sending file...")
 
-    if file_type == "video":
-        watch_url = make_watch_url(user.id, unique_id)
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Watch Now", url=watch_url)
-        ]])
-        await update.message.reply_text(
-            f"🎬 <b>{file_name}</b>\n"
+    try:
+        caption = (
+            f"📁 <b>{file_name}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ File ready to stream!\n\n"
             f"📦 Size: {size_mb:.1f} MB\n"
             f"👁️ Views: {views}\n"
-            f"🔒 Personal secure link\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👇 Click to watch:",
-            parse_mode="HTML",
-            reply_markup=kb
+            f"🤖 Served by Bot {SERVER_ID}"
         )
-    else:
-        stream_url = st_file.get("stream_url", "")
-        await update.message.reply_text(
-            f"📁 <b>{file_name}</b>\n\n"
-            f"📦 Size: {size_mb:.1f} MB\n\n"
-            f"🔗 Download:\n<code>{stream_url}</code>",
+
+        if file_type == "video":
+            await ctx.bot.send_video(
+                chat_id=user.id,
+                video=file_id,
+                caption=caption,
+                parse_mode="HTML",
+                supports_streaming=True,
+            )
+        elif file_type == "audio":
+            await ctx.bot.send_audio(
+                chat_id=user.id,
+                audio=file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:
+            await ctx.bot.send_document(
+                chat_id=user.id,
+                document=file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        await msg.delete()
+        logger.info(f"✅ File sent: {file_name} → user {user.id}")
+
+    except Exception as e:
+        logger.error(f"File send error: {e}")
+        await msg.edit_text(
+            f"❌ <b>Failed to send file!</b>\n\n"
+            f"Error: <code>{str(e)[:100]}</code>",
             parse_mode="HTML"
         )
 
 
 async def send_verification_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, unique_id: str):
-    user      = update.effective_user
+    user       = update.effective_user
     verify_url = f"{BASE_URL}/verify/{user.id}"
     short_url  = shorten_url(verify_url)
 
-    text = (
+    await update.message.reply_text(
         "🔐 <b>Verification Required</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "⚠️ You need to verify to access this file.\n\n"
@@ -1173,31 +574,29 @@ async def send_verification_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYP
         "┗ 3️⃣ Come back &amp; click file link again\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "⏳ Token valid for <b>24 hours</b>\n"
-        "💎 Get Premium to skip forever!"
+        "💎 Get Premium to skip forever!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Verify Now", url=short_url),
+            InlineKeyboardButton("💎 Get Premium", callback_data="premium_menu")
+        ]])
     )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Verify Now", url=short_url),
-        InlineKeyboardButton("💎 Get Premium", callback_data="premium_menu")
-    ]])
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def mystatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user    = update.effective_user
-    db_user = get_user(user.id)
-    access  = get_access(user.id)
-
+    user      = update.effective_user
+    db_user   = get_user(user.id)
+    access    = get_access(user.id)
     token_exp = access.get("token_expiry")
     prem_exp  = access.get("premium_expiry")
     refs      = db_user.get("referrals_count", 0)
     joined    = db_user.get("joined_at", datetime.utcnow())
-    joined_str = joined.strftime("%d %b %Y") if hasattr(joined, "strftime") else str(joined)[:10]
+    joined_str= joined.strftime("%d %b %Y") if hasattr(joined, "strftime") else str(joined)[:10]
 
     if token_exp and token_exp > datetime.utcnow():
         remaining = token_exp - datetime.utcnow()
-        h, rem    = divmod(int(remaining.total_seconds()), 3600)
-        m         = rem // 60
-        token_str = f"✅ Valid  •  ⏳ {h}h {m}m left"
+        h, rem = divmod(int(remaining.total_seconds()), 3600)
+        token_str = f"✅ Valid  •  ⏳ {h}h {rem//60}m left"
     else:
         token_str = "❌ No active token"
 
@@ -1224,10 +623,9 @@ async def mystatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def referral_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user     = update.effective_user
-    db_user  = get_user(user.id)
-    refs     = db_user.get("referrals_count", 0)
+    refs     = get_user(user.id).get("referrals_count", 0)
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
-    next_milestone = max(0, REFERRAL_PREMIUM_COUNT - refs)
+    next_mil = max(0, REFERRAL_PREMIUM_COUNT - refs)
 
     await update.message.reply_text(
         f"👥 <b>Referral Program</b>\n"
@@ -1236,7 +634,7 @@ async def referral_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<code>{ref_link}</code>\n\n"
         f"📊 <b>Your Stats:</b>\n"
         f"┣ 👤 Total Referred: <b>{refs}</b>\n"
-        f"┗ 🎯 Need <b>{next_milestone} more</b> for 7-day Premium\n\n"
+        f"┗ 🎯 Need <b>{next_mil} more</b> for 7-day Premium\n\n"
         f"🎁 <b>Rewards:</b>\n"
         f"┣ ⏰ Every 5 referrals → Bonus token hours\n"
         f"┗ 🏆 {REFERRAL_PREMIUM_COUNT} referrals → 7-day Premium FREE!\n\n"
@@ -1244,10 +642,8 @@ async def referral_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📤 Share now and start earning! 🚀",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "📤 Share Now",
-                url=f"https://t.me/share/url?url={urllib.parse.quote(ref_link)}&text=Join+this+amazing+bot!"
-            )
+            InlineKeyboardButton("📤 Share Now",
+                url=f"https://t.me/share/url?url={urllib.parse.quote(ref_link)}&text=Join+this+amazing+bot!")
         ]])
     )
 
@@ -1257,13 +653,10 @@ async def premium_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_premium_menu(msg_or_query):
-    plan_lines = "\n".join([
-        f"┣ 💎 <b>{v['label']}</b>  —  ₹{v['price']}"
-        for v in list(PREMIUM_PLANS.values())[:-1]
-    ] + [
-        f"┗ 👑 <b>{list(PREMIUM_PLANS.values())[-1]['label']}</b>"
-        f"  —  ₹{list(PREMIUM_PLANS.values())[-1]['price']}"
-    ])
+    plan_lines = "\n".join(
+        [f"┣ 💎 <b>{v['label']}</b>  —  ₹{v['price']}" for v in list(PREMIUM_PLANS.values())[:-1]] +
+        [f"┗ 👑 <b>{list(PREMIUM_PLANS.values())[-1]['label']}</b>  —  ₹{list(PREMIUM_PLANS.values())[-1]['price']}"]
+    )
     text = (
         f"💎 <b>Premium Access</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1272,8 +665,8 @@ async def show_premium_menu(msg_or_query):
         f"✅ <b>Premium Benefits:</b>\n"
         f"┣ ⚡ Skip daily verification\n"
         f"┣ ♾️ Unlimited file access\n"
-        f"┣ 🚀 Faster streaming\n"
-        f"┗ 🎯 Priority support\n\n"
+        f"┣ 🚀 Priority support\n"
+        f"┗ 🎯 Access all bots\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"👇 Select a plan to proceed:"
     )
@@ -1314,7 +707,6 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📋 <b>After Payment:</b>\n"
             f"Send your UTR/Transaction ID:\n"
             f"<code>/utr YOUR_UTR_NUMBER</code>\n\n"
-            f"📌 Example: <code>/utr 123456789012</code>\n\n"
             f"⚠️ <b>Important:</b> Do NOT close this chat until approved!"
         )
         buttons = []
@@ -1332,7 +724,7 @@ async def utr_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     utr = args[0].strip()
     if not re.match(r'^[A-Za-z0-9]{10,22}$', utr):
-        await update.message.reply_text("❌ Invalid UTR format. Please check and try again.")
+        await update.message.reply_text("❌ Invalid UTR format.")
         return
     if payments_col.find_one({"utr": utr}):
         await update.message.reply_text("❌ This UTR has already been submitted.")
@@ -1340,50 +732,35 @@ async def utr_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     plan_key = ctx.user_data.get("pending_plan", "1month")
     plan     = PREMIUM_PLANS.get(plan_key, PREMIUM_PLANS["1month"])
-
     payments_col.insert_one({
-        "user_id":    user.id,
-        "username":   user.username or "N/A",
-        "utr":        utr,
-        "plan":       plan_key,
-        "price":      plan["price"],
-        "status":     "pending",
-        "created_at": datetime.utcnow()
+        "user_id": user.id, "username": user.username or "N/A",
+        "utr": utr, "plan": plan_key, "price": plan["price"],
+        "status": "pending", "created_at": datetime.utcnow()
     })
 
     await update.message.reply_text(
         f"✅ <b>Payment Submitted!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔢 <b>UTR Number:</b>\n"
-        f"<code>{utr}</code>\n\n"
+        f"🔢 <b>UTR:</b> <code>{utr}</code>\n"
         f"📦 <b>Plan:</b> {plan['label']}\n"
         f"💰 <b>Amount:</b> ₹{plan['price']}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏳ Admin will verify within a few hours\n"
-        f"🔔 You will be notified once approved\n\n"
-        f"📞 Contact admin if not approved in 24h",
+        f"🔔 You will be notified once approved",
         parse_mode="HTML"
     )
-
-    uid_v      = user.id
-    uname_v    = user.username or "N/A"
-    plan_label = plan['label']
-    plan_price = plan['price']
-
     for admin_id in ADMIN_IDS:
         try:
             await ctx.bot.send_message(
                 admin_id,
                 f"🔔 <b>New Payment Request!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 <b>User:</b> <code>{uid_v}</code>\n"
-                f"📛 <b>Username:</b> @{uname_v}\n"
-                f"📦 <b>Plan:</b> {plan_label}\n"
-                f"💰 <b>Amount:</b> ₹{plan_price}\n"
+                f"👤 <b>User:</b> <code>{user.id}</code>\n"
+                f"📛 <b>Username:</b> @{user.username or 'N/A'}\n"
+                f"📦 <b>Plan:</b> {plan['label']}\n"
+                f"💰 <b>Amount:</b> ₹{plan['price']}\n"
                 f"🔢 <b>UTR:</b> <code>{utr}</code>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Approve: <code>/approve {uid_v}</code>\n"
-                f"❌ Reject:  <code>/reject {uid_v}</code>",
+                f"✅ Approve: <code>/approve {user.id}</code>\n"
+                f"❌ Reject:  <code>/reject {user.id}</code>",
                 parse_mode="HTML"
             )
         except Exception:
@@ -1400,39 +777,22 @@ async def approve_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text("Usage: /approve <user_id>")
         return
-    try:
-        uid = int(args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
-
-    payment = payments_col.find_one(
-        {"user_id": uid, "status": "pending"},
-        sort=[("created_at", -1)]
-    )
+    uid     = int(args[0])
+    payment = payments_col.find_one({"user_id": uid, "status": "pending"}, sort=[("created_at", -1)])
     if not payment:
         await update.message.reply_text(f"No pending payment for {uid}.")
         return
-
     plan   = PREMIUM_PLANS.get(payment.get("plan", "1month"), PREMIUM_PLANS["1month"])
     expiry = grant_premium(uid, plan["days"])
     payments_col.update_one({"_id": payment["_id"]}, {"$set": {"status": "approved"}})
-
-    await update.message.reply_text(
-        f"✅ Approved! User {uid} has premium until {expiry.strftime('%d %b %Y')}."
-    )
+    await update.message.reply_text(f"✅ Approved! User {uid} has premium until {expiry.strftime('%d %b %Y')}.")
     try:
-        await ctx.bot.send_message(
-            uid,
+        await ctx.bot.send_message(uid,
             f"🎉 <b>Payment Approved!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ <b>{plan['label']} Premium</b> activated!\n\n"
-            f"📅 <b>Expires:</b> {expiry.strftime('%d %b %Y')}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ Skip verification on all files!\n"
-            f"🚀 Enjoy unlimited access!",
-            parse_mode="HTML"
-        )
+            f"✅ <b>{plan['label']} Premium</b> activated!\n"
+            f"📅 Expires: {expiry.strftime('%d %b %Y')}\n\n"
+            f"🚀 Enjoy unlimited access!", parse_mode="HTML")
     except Exception:
         pass
 
@@ -1443,37 +803,18 @@ async def reject_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text("Usage: /reject <user_id>")
         return
-    try:
-        uid = int(args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
-
-    payment = payments_col.find_one(
-        {"user_id": uid, "status": "pending"},
-        sort=[("created_at", -1)]
-    )
+    uid     = int(args[0])
+    payment = payments_col.find_one({"user_id": uid, "status": "pending"}, sort=[("created_at", -1)])
     if not payment:
         await update.message.reply_text(f"No pending payment for {uid}.")
         return
-
     payments_col.update_one({"_id": payment["_id"]}, {"$set": {"status": "rejected"}})
     await update.message.reply_text(f"❌ Rejected payment for user {uid}.")
     try:
-        await ctx.bot.send_message(
-            uid,
-            "❌ <b>Payment Rejected</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "⚠️ Your payment could not be verified.\n\n"
-            "📋 <b>Possible reasons:</b>\n"
-            "┣ Invalid UTR number\n"
-            "┣ Payment not received\n"
-            "┗ Wrong UPI ID used\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "💬 Contact admin for help\n"
-            "🔄 Or try again with correct UTR",
-            parse_mode="HTML"
-        )
+        await ctx.bot.send_message(uid,
+            "❌ <b>Payment Rejected</b>\n\n"
+            "Your payment could not be verified.\n"
+            "Contact admin for help.", parse_mode="HTML")
     except Exception:
         pass
 
@@ -1484,16 +825,9 @@ async def addpremium_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text("Usage: /addpremium <user_id> <days>")
         return
-    try:
-        uid  = int(args[0])
-        days = int(args[1])
-    except ValueError:
-        await update.message.reply_text("Invalid arguments.")
-        return
+    uid, days = int(args[0]), int(args[1])
     expiry = grant_premium(uid, days)
-    await update.message.reply_text(
-        f"✅ Added {days}-day premium to {uid}.\nExpires: {expiry.strftime('%d %b %Y')}"
-    )
+    await update.message.reply_text(f"✅ Added {days}-day premium to {uid}. Expires: {expiry.strftime('%d %b %Y')}")
     try:
         await ctx.bot.send_message(uid, f"🎁 Admin gifted you {days}-day Premium! Enjoy! 🚀")
     except Exception:
@@ -1506,30 +840,21 @@ async def removepremium_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text("Usage: /removepremium <user_id>")
         return
-    uid = int(args[0])
-    revoke_premium(uid)
-    await update.message.reply_text(f"✅ Premium removed from {uid}.")
+    revoke_premium(int(args[0]))
+    await update.message.reply_text(f"✅ Premium removed from {args[0]}.")
 
 
 @admin_only
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    total_users   = users_col.count_documents({})
-    premium_users = users_col.count_documents({
-        "user_id": {"$in": [
-            a["user_id"] for a in access_col.find(
-                {"premium_expiry": {"$gt": datetime.utcnow()}},
-                {"user_id": 1}
-            )
-        ]}
-    })
-    total_files   = streamtape_col.count_documents({})
-    pending_pay   = payments_col.count_documents({"status": "pending"})
-    total_refs    = referrals_col.count_documents({})
-    concurrent    = get_concurrent_users()
-    slots_left    = max(0, MAX_USERS - total_users)
-    load_pct      = int((total_users / MAX_USERS) * 100) if MAX_USERS > 0 else 0
-    filled        = int(load_pct / 10)
-    bar           = "█" * filled + "░" * (10 - filled)
+    total_users  = users_col.count_documents({})
+    prem_count   = access_col.count_documents({"premium_expiry": {"$gt": datetime.utcnow()}})
+    total_files  = files_col.count_documents({})
+    pending_pay  = payments_col.count_documents({"status": "pending"})
+    total_refs   = referrals_col.count_documents({})
+    concurrent   = get_concurrent_users()
+    slots_left   = max(0, MAX_USERS - total_users)
+    load_pct     = int((total_users / MAX_USERS) * 100) if MAX_USERS else 0
+    bar          = "█" * int(load_pct / 10) + "░" * (10 - int(load_pct / 10))
 
     await update.message.reply_text(
         f"📊 <b>Bot Statistics</b>\n"
@@ -1537,7 +862,7 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🤖 <b>Server {SERVER_ID}</b>\n\n"
         f"👥 <b>Users</b>\n"
         f"┣ 👤 Total: <b>{total_users}/{MAX_USERS}</b>\n"
-        f"┣ 💎 Premium: <b>{premium_users}</b>\n"
+        f"┣ 💎 Premium: <b>{prem_count}</b>\n"
         f"┣ ⚡ Active Now: <b>{concurrent}</b>\n"
         f"┗ 🆓 Slots Left: <b>{slots_left}</b>\n\n"
         f"📈 <b>Load</b>\n"
@@ -1553,14 +878,14 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
-async def stfiles_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    files = list(streamtape_col.find().sort("upload_time", -1).limit(10))
-    if not files:
+async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    file_list = list(files_col.find().sort("upload_time", -1).limit(10))
+    if not file_list:
         await update.message.reply_text("No files uploaded yet.")
         return
     lines = ["📁 <b>Last 10 Files:</b>\n"]
-    for f in files:
-        link    = make_st_deep_link(f["unique_id"])
+    for f in file_list:
+        link    = make_deep_link(f["unique_id"])
         size_mb = (f.get("file_size", 0) or 0) / 1024 / 1024
         views   = f.get("view_count", 0)
         lines.append(
@@ -1569,81 +894,14 @@ async def stfiles_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   <code>{link}</code>"
         )
     await update.message.reply_text(
-        "\n\n".join(lines),
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
-
-
-@admin_only
-async def stadd_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Add large file by Streamtape video ID: /stadd VIDEO_ID name.mp4"""
-    args = ctx.args
-    if not args:
-        await update.message.reply_text(
-            "📋 <b>Usage:</b>\n"
-            "<code>/sfadd FILE_CODE filename.mp4</code>\n\n"
-            "<b>Steps for large files (&gt;20MB):</b>\n"
-            "┣ 1️⃣ Upload to streamtape.com manually\n"
-            "┣ 2️⃣ Copy file code from URL\n"
-            "┗ 3️⃣ Send: <code>/sfadd CODE filename.mp4</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    video_id = args[0].strip()
-    file_name = " ".join(args[1:]).strip() if len(args) > 1 else f"file_{video_id}"
-    file_type = (
-        "video" if any(file_name.lower().endswith(e)
-                       for e in [".mp4", ".mkv", ".webm", ".avi", ".mov"])
-        else "document"
-    )
-
-    msg = await update.message.reply_text("🔍 Verifying on Streamtape...")
-
-    info = streamtape_file_info(video_id)
-    if not info:
-        await msg.edit_text(
-            f"❌ <b>File not found!</b>\n\n"
-            f"Code: <code>{video_id}</code>\n"
-            f"Make sure it's uploaded to streamtape.com",
-            parse_mode="HTML"
-        )
-        return
-
-    file_size  = int(info.get("size", 0))
-    size_mb    = file_size / 1024 / 1024 if file_size else 0
-    stream_url = f"https://xvs.tt/{video_id}"
-    unique_id  = uuid.uuid4().hex[:16]
-
-    save_st_file(
-        unique_id  = unique_id,
-        video_id  = video_id,
-        stream_url = stream_url,
-        file_name  = file_name,
-        file_size  = file_size,
-        file_type  = file_type,
-    )
-
-    deep_link = make_st_deep_link(unique_id)
-
-    await msg.edit_text(
-        f"✅ <b>File Added!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📁 <b>Name:</b> <code>{file_name}</code>\n"
-        f"📦 <b>Size:</b> {size_mb:.1f} MB\n"
-        f"🆔 <b>Code:</b> <code>{video_id}</code>\n\n"
-        f"🔗 <b>Universal Share Link:</b>\n"
-        f"<code>{deep_link}</code>\n\n"
-        f"✅ This ONE link works on ALL bots!",
-        parse_mode="HTML"
+        "\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
     )
 
 
 @admin_only
 async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a message with /broadcast to send it to all users.")
+        await update.message.reply_text("Reply to a message with /broadcast to send to all users.")
         return
     reply_msg = update.message.reply_to_message
     all_users = [u["user_id"] for u in users_col.find({}, {"user_id": 1})]
@@ -1656,14 +914,16 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
-    await status.edit_text(
-        f"✅ Broadcast complete!\n✔️ Delivered: {success}\n❌ Failed: {failed}"
-    )
+    await status.edit_text(f"✅ Broadcast done!\n✔️ Delivered: {success}\n❌ Failed: {failed}")
 
 
 @admin_only
 async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin uploads file → Streamtape → Universal link."""
+    """
+    Admin sends file → Bot saves file_id → Returns share link.
+    No download, no external storage — pure Telegram!
+    Works for ANY file size Telegram allows.
+    """
     msg       = update.message
     user      = update.effective_user
     tg_file   = None
@@ -1686,61 +946,49 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    size_mb         = file_size / 1024 / 1024 if file_size else 0
-    MAX_TG_BOT_SIZE = 20 * 1024 * 1024  # 20 MB
-
-    if file_size > MAX_TG_BOT_SIZE:
-        await msg.reply_text(
-            f"⚠️ <b>File too large ({size_mb:.0f} MB)!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📏 Bot API limit: 20 MB\n\n"
-            f"✅ <b>Use this instead:</b>\n"
-            f"┣ 1️⃣ Upload to streamtape.com manually\n"
-            f"┣ 2️⃣ Copy the file code from URL\n"
-            f"┗ 3️⃣ Send: <code>/sfadd FILE_CODE {file_name}</code>",
-            parse_mode="HTML"
-        )
-        return
-
+    size_mb   = file_size / 1024 / 1024 if file_size else 0
     processing = await msg.reply_text(
-        f"⚡ <b>Processing...</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📁 <b>{file_name}</b>\n"
-        f"📦 {size_mb:.1f} MB\n\n"
-        f"⏳ Please wait...",
+        f"⚡ <b>Saving file...</b>\n\n📁 {file_name}\n📦 {size_mb:.1f} MB",
         parse_mode="HTML"
     )
 
     try:
-        await processing.edit_text(f"⬇️ Downloading {size_mb:.1f} MB from Telegram...")
-        file_obj   = await ctx.bot.get_file(tg_file.file_id)
-        file_bytes = bytes(await file_obj.download_as_bytearray())
-
-        await processing.edit_text(f"☁️ Uploading to Streamtape.com...")
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: upload_to_streamtape(file_bytes, file_name)
-        )
-
-        if not result:
-            await processing.edit_text(
-                "❌ <b>Streamtape upload failed!</b>\n\n"
-                "Please check ST_KEY or try again.",
-                parse_mode="HTML"
-            )
-            return
-
+        file_id   = tg_file.file_id
         unique_id = uuid.uuid4().hex[:16]
-        save_st_file(
-            unique_id        = unique_id,
-            video_id        = result["video_id"],
-            stream_url       = result["stream_url"],
-            file_name        = file_name,
-            file_size        = file_size,
-            file_type        = file_type,
-            telegram_file_id = tg_file.file_id,
-        )
 
-        deep_link = make_st_deep_link(unique_id)
+        # If storage channel configured — forward there for permanent file_id
+        if STORAGE_CHANNEL_ID:
+            try:
+                if file_type == "video":
+                    sent = await ctx.bot.send_video(
+                        chat_id=int(STORAGE_CHANNEL_ID),
+                        video=file_id,
+                        caption=file_name,
+                        supports_streaming=True
+                    )
+                    file_id = sent.video.file_id
+                elif file_type == "audio":
+                    sent = await ctx.bot.send_audio(
+                        chat_id=int(STORAGE_CHANNEL_ID),
+                        audio=file_id,
+                        caption=file_name
+                    )
+                    file_id = sent.audio.file_id
+                else:
+                    sent = await ctx.bot.send_document(
+                        chat_id=int(STORAGE_CHANNEL_ID),
+                        document=file_id,
+                        caption=file_name
+                    )
+                    file_id = sent.document.file_id
+                logger.info(f"✅ Forwarded to storage channel: {file_id[:30]}")
+            except Exception as e:
+                logger.warning(f"Storage channel forward failed: {e} — using original file_id")
+
+        # Save to DB
+        save_file(unique_id, file_id, file_name, file_size, file_type)
+
+        deep_link = make_deep_link(unique_id)
 
         # Delete original message
         try:
@@ -1749,23 +997,22 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
         await processing.edit_text(
-            f"✅ <b>File Uploaded Successfully!</b>\n"
+            f"✅ <b>File Saved!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📁 <b>Name:</b> <code>{file_name}</code>\n"
-            f"📦 <b>Size:</b> {size_mb:.1f} MB\n"
-            f"🆔 <b>Code:</b> <code>{result['video_id']}</code>\n\n"
-            f"🔗 <b>Universal Share Link:</b>\n"
+            f"📦 <b>Size:</b> {size_mb:.1f} MB\n\n"
+            f"🔗 <b>Share Link:</b>\n"
             f"<code>{deep_link}</code>\n\n"
             f"✅ This ONE link works on ALL bots!\n"
-            f"📌 Share only this link — nothing else needed.",
+            f"📌 Share only this link.",
             parse_mode="HTML"
         )
-        logger.info(f"Admin {user.id} uploaded: {file_name} → {result['video_id']}")
+        logger.info(f"Admin {user.id} uploaded: {file_name}")
 
     except Exception as e:
         logger.error(f"Upload error: {e}")
         await processing.edit_text(
-            f"❌ <b>Upload Failed!</b>\n\n<code>{str(e)[:200]}</code>",
+            f"❌ <b>Failed!</b>\n\n<code>{str(e)[:200]}</code>",
             parse_mode="HTML"
         )
 
@@ -1786,15 +1033,14 @@ def build_application() -> Application:
 
     # Admin
     app.add_handler(CommandHandler("stats",          stats_cmd))
-    app.add_handler(CommandHandler("stfiles",        stfiles_cmd))
-    app.add_handler(CommandHandler("stadd",          stadd_cmd))
+    app.add_handler(CommandHandler("files",          files_cmd))
     app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
     app.add_handler(CommandHandler("approve",        approve_cmd))
     app.add_handler(CommandHandler("reject",         reject_cmd))
     app.add_handler(CommandHandler("addpremium",     addpremium_cmd))
     app.add_handler(CommandHandler("removepremium",  removepremium_cmd))
 
-    # File upload (admin only)
+    # File upload (admin)
     app.add_handler(MessageHandler(
         filters.User(ADMIN_IDS) & (filters.VIDEO | filters.Document.ALL | filters.AUDIO),
         handle_upload
@@ -1823,7 +1069,7 @@ async def init_application():
     _bot_application = build_application()
     await _bot_application.initialize()
     await _bot_application.start()
-    logger.info("✅ Bot application initialized (webhook mode)")
+    logger.info("✅ Bot initialized (webhook mode)")
 
 
 def process_update_sync(data: dict):
@@ -1832,24 +1078,21 @@ def process_update_sync(data: dict):
     try:
         update = TGUpdate.de_json(data, _bot_application.bot)
         future = asyncio.run_coroutine_threadsafe(
-            _bot_application.process_update(update),
-            _bot_loop
+            _bot_application.process_update(update), _bot_loop
         )
         future.result(timeout=60)
     except Exception as e:
-        logger.error(f"Update processing error: {e}")
+        logger.error(f"Update error: {e}")
 
 
 @flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    global _bot_application
     if _bot_application is None:
         abort(503)
     data = request.get_json(force=True, silent=True)
     if not data:
         abort(400)
-    t = threading.Thread(target=process_update_sync, args=(data,), daemon=True)
-    t.start()
+    threading.Thread(target=process_update_sync, args=(data,), daemon=True).start()
     return "OK", 200
 
 
@@ -1860,54 +1103,38 @@ def webhook():
 def main():
     global _bot_loop
 
-    logger.info("🚀 Starting FileBot (Streamtape Edition)")
+    logger.info("🚀 Starting FileBot (Direct Telegram Edition)")
 
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not set!")
         return
-    if not ST_KEY:
-        logger.warning("⚠️  ST_KEY not set — uploads will fail!")
     if not ADMIN_IDS:
         logger.warning("⚠️  No ADMIN_IDS set!")
 
-    # Start persistent event loop in background thread
     _bot_loop = asyncio.new_event_loop()
-    loop_thread = threading.Thread(target=run_event_loop, args=(_bot_loop,), daemon=True)
-    loop_thread.start()
-    logger.info("✅ Async event loop started")
+    threading.Thread(target=run_event_loop, args=(_bot_loop,), daemon=True).start()
+    logger.info("✅ Event loop started")
 
-    # Initialize bot application
     future = asyncio.run_coroutine_threadsafe(init_application(), _bot_loop)
     future.result(timeout=30)
 
-    # Set webhook
     webhook_url = f"{BASE_URL}/webhook/{BOT_TOKEN}"
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-            json={
-                "url": webhook_url,
-                "drop_pending_updates": True,
-                "allowed_updates": ["message", "callback_query"]
-            },
+            json={"url": webhook_url, "drop_pending_updates": True,
+                  "allowed_updates": ["message", "callback_query"]},
             timeout=15
         )
-        result = resp.json()
-        if result.get("ok"):
+        if resp.json().get("ok"):
             logger.info(f"✅ Webhook set: {webhook_url}")
         else:
-            logger.error(f"❌ Webhook failed: {result}")
+            logger.error(f"❌ Webhook failed: {resp.json()}")
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
 
-    logger.info(f"✅ Starting Flask on port {PORT}")
-    flask_app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False,
-        use_reloader=False,
-        threaded=True
-    )
+    logger.info(f"✅ Flask starting on port {PORT}")
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
