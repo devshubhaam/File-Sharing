@@ -262,18 +262,99 @@ def invalidate_token_cache(user_id: int):
 
 def save_file(unique_id: str, file_id: str, file_name: str,
               file_size: int, file_type: str) -> dict:
-    doc = {
-        "unique_id":  unique_id,
-        "file_id":    file_id,
-        "file_name":  file_name,
-        "file_size":  file_size,
-        "file_type":  file_type,
-        "upload_time": datetime.utcnow(),
-        "view_count": 0,
-    }
-    files_col.update_one({"unique_id": unique_id}, {"$set": doc}, upsert=True)
-    logger.info(f"✅ File saved: {file_name} | unique_id: {unique_id}")
-    return doc
+    """Save new file OR add file_id to existing file (backward compatible)."""
+    now = datetime.utcnow()
+
+    # Check if file already exists
+    existing = files_col.find_one({"unique_id": unique_id})
+
+    if existing:
+        # Add new file_id to list (no duplicates)
+        files_col.update_one(
+            {"unique_id": unique_id},
+            {
+                "$addToSet": {"file_ids": file_id},
+                "$set": {"last_updated": now}
+            }
+        )
+        # Backward compat: keep file_id field as primary
+        files_col.update_one(
+            {"unique_id": unique_id},
+            {"$set": {"file_id": file_id}}
+        )
+        logger.info(f"✅ File_id added to existing: {unique_id} | new id: {file_id[:20]}...")
+        return files_col.find_one({"unique_id": unique_id})
+    else:
+        # New file — create with file_ids list
+        doc = {
+            "unique_id":   unique_id,
+            "file_id":     file_id,          # Backward compat
+            "file_ids":    [file_id],         # New: list of backup IDs
+            "file_name":   file_name,
+            "file_size":   file_size,
+            "file_type":   file_type,
+            "upload_time": now,
+            "last_updated": now,
+            "view_count":  0,
+        }
+        files_col.update_one({"unique_id": unique_id}, {"$set": doc}, upsert=True)
+        logger.info(f"✅ New file saved: {file_name} | unique_id: {unique_id}")
+        return doc
+
+
+def add_file_id(unique_id: str, file_id: str) -> bool:
+    """Add a new file_id to existing file — auto backup."""
+    result = files_col.update_one(
+        {"unique_id": unique_id},
+        {
+            "$addToSet": {"file_ids": file_id},
+            "$set": {"file_id": file_id, "last_updated": datetime.utcnow()}
+        }
+    )
+    if result.matched_count:
+        logger.info(f"✅ Backup file_id added: {unique_id} | {file_id[:20]}...")
+        return True
+    return False
+
+
+def remove_dead_file_id(unique_id: str, dead_file_id: str):
+    """Remove a dead/expired file_id from DB."""
+    files_col.update_one(
+        {"unique_id": unique_id},
+        {"$pull": {"file_ids": dead_file_id}}
+    )
+    # If removed file_id was primary, update primary to first remaining
+    doc = files_col.find_one({"unique_id": unique_id})
+    if doc:
+        remaining = doc.get("file_ids", [])
+        if remaining and doc.get("file_id") == dead_file_id:
+            files_col.update_one(
+                {"unique_id": unique_id},
+                {"$set": {"file_id": remaining[0]}}
+            )
+    logger.warning(f"🗑️ Dead file_id removed: {unique_id} | {dead_file_id[:20]}...")
+
+
+def extract_unique_id_from_caption(caption: str) -> str | None:
+    """
+    Extract unique_id from caption.
+    Supports formats:
+      ID: abc123
+      id: abc123
+      File ID: abc123
+      #abc123
+    """
+    if not caption:
+        return None
+    # Match "ID: abc123" or "id:abc123" or "File ID: abc123"
+    match = re.search(r'(?:file\s*)?id\s*[:\-]\s*([a-zA-Z0-9]{8,32})', caption, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # Match hashtag format: #abc123def456
+    match = re.search(r'#([a-zA-Z0-9]{8,32})', caption)
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def get_file(unique_id: str) -> dict | None:
@@ -487,8 +568,29 @@ async def send_redirect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
+async def send_file_to_user(bot, chat_id: int, file_id: str,
+                            file_type: str, caption: str) -> bool:
+    """Try sending a single file_id. Returns True if success."""
+    try:
+        if file_type == "video":
+            await bot.send_video(chat_id=chat_id, video=file_id,
+                caption=caption, parse_mode="HTML", supports_streaming=True)
+        elif file_type == "audio":
+            await bot.send_audio(chat_id=chat_id, audio=file_id,
+                caption=caption, parse_mode="HTML")
+        else:
+            await bot.send_document(chat_id=chat_id, document=file_id,
+                caption=caption, parse_mode="HTML")
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        if any(x in err for x in ["wrong file", "file_id", "invalid", "not found", "bad request"]):
+            return False  # Dead file_id
+        raise  # Other error (flood, network) — re-raise
+
+
 async def handle_file_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, unique_id: str):
-    """Send file directly to user via Telegram file_id."""
+    """Send file via fallback system — tries all file_ids, removes dead ones."""
     user    = update.effective_user
     tg_file = get_file(unique_id)
 
@@ -499,62 +601,76 @@ async def handle_file_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, un
         )
         return
 
-    # Check token
     if not has_valid_token(user.id):
         await send_verification_prompt(update, ctx, unique_id)
         return
 
-    file_id   = tg_file["file_id"]
     file_name = tg_file.get("file_name", "file")
     file_type = tg_file.get("file_type", "document")
     file_size = tg_file.get("file_size", 0)
     size_mb   = file_size / 1024 / 1024 if file_size else 0
 
+    # Get all file_ids (new list system + backward compat)
+    file_ids = tg_file.get("file_ids", [])
+    if not file_ids:
+        # Backward compat: single file_id
+        old_fid = tg_file.get("file_id", "")
+        if old_fid:
+            file_ids = [old_fid]
+
+    if not file_ids:
+        await update.message.reply_text(
+            "❌ <b>No file available!</b>\n\nContact admin.",
+            parse_mode="HTML"
+        )
+        return
+
     # Track views
     files_col.update_one({"unique_id": unique_id}, {"$inc": {"view_count": 1}})
     views = tg_file.get("view_count", 0) + 1
 
+    caption = (
+        f"📁 <b>{file_name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 Size: {size_mb:.1f} MB\n"
+        f"👁️ Views: {views}\n"
+        f"🤖 Server {SERVER_ID}  •  🔗 {len(file_ids)} backup(s)"
+    )
+
     msg = await update.message.reply_text("⏳ Sending file...")
 
-    try:
-        caption = (
-            f"📁 <b>{file_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 Size: {size_mb:.1f} MB\n"
-            f"👁️ Views: {views}\n"
-            f"🤖 Served by Bot {SERVER_ID}"
-        )
+    sent     = False
+    dead_ids = []
 
-        if file_type == "video":
-            await ctx.bot.send_video(
-                chat_id=user.id,
-                video=file_id,
-                caption=caption,
-                parse_mode="HTML",
-                supports_streaming=True,
-            )
-        elif file_type == "audio":
-            await ctx.bot.send_audio(
-                chat_id=user.id,
-                audio=file_id,
-                caption=caption,
-                parse_mode="HTML",
-            )
-        else:
-            await ctx.bot.send_document(
-                chat_id=user.id,
-                document=file_id,
-                caption=caption,
-                parse_mode="HTML",
-            )
+    # ── Fallback: try each file_id ────────────────────────────────────────
+    for fid in file_ids:
+        try:
+            success = await send_file_to_user(ctx.bot, user.id, fid, file_type, caption)
+            if success:
+                sent = True
+                logger.info(f"✅ File sent: {file_name} → user {user.id} | fid: {fid[:20]}")
+                break
+            else:
+                logger.warning(f"⚠️ Dead file_id detected: {fid[:20]} | {unique_id}")
+                dead_ids.append(fid)
+        except Exception as e:
+            logger.error(f"File send error (non-dead): {e}")
+            break
+
+    # ── Remove dead file_ids ──────────────────────────────────────────────
+    for dead_fid in dead_ids:
+        remove_dead_file_id(unique_id, dead_fid)
+
+    if sent:
         await msg.delete()
-        logger.info(f"✅ File sent: {file_name} → user {user.id}")
-
-    except Exception as e:
-        logger.error(f"File send error: {e}")
+    else:
+        backup_count = len(file_ids)
         await msg.edit_text(
-            f"❌ <b>Failed to send file!</b>\n\n"
-            f"Error: <code>{str(e)[:100]}</code>",
+            f"❌ <b>File unavailable!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⚠️ All {backup_count} backup(s) failed.\n\n"
+            f"📌 Contact admin to re-upload:\n"
+            f"<code>ID: {unique_id}</code>",
             parse_mode="HTML"
         )
 
@@ -885,16 +1001,43 @@ async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📁 <b>Last 10 Files:</b>\n"]
     for f in file_list:
-        link    = make_deep_link(f["unique_id"])
-        size_mb = (f.get("file_size", 0) or 0) / 1024 / 1024
-        views   = f.get("view_count", 0)
+        link     = make_deep_link(f["unique_id"])
+        size_mb  = (f.get("file_size", 0) or 0) / 1024 / 1024
+        views    = f.get("view_count", 0)
+        backups  = len(f.get("file_ids", [f.get("file_id", "")]))
         lines.append(
             f"▪️ <b>{f.get('file_name', '?')}</b>\n"
-            f"   📦 {size_mb:.1f} MB • 👁️ {views} views\n"
+            f"   📦 {size_mb:.1f} MB • 👁️ {views} views • 🔗 {backups} backup(s)\n"
+            f"   🆔 <code>{f['unique_id']}</code>\n"
             f"   <code>{link}</code>"
         )
     await update.message.reply_text(
         "\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+@admin_only
+async def backups_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show backup stats for all files."""
+    total     = files_col.count_documents({})
+    multi     = files_col.count_documents({"file_ids.1": {"$exists": True}})  # 2+ backups
+    no_backup = files_col.count_documents({"$or": [
+        {"file_ids": {"$exists": False}},
+        {"file_ids": {"$size": 1}}
+    ]})
+
+    await update.message.reply_text(
+        f"🔗 <b>Backup System Stats</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📁 Total Files: <b>{total}</b>\n"
+        f"✅ Multi-backup: <b>{multi}</b>\n"
+        f"⚠️ Single/No backup: <b>{no_backup}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <b>How to add backup:</b>\n"
+        f"Upload file to any channel with caption:\n"
+        f"<code>ID: unique_id_here</code>\n\n"
+        f"Bot will auto-add as backup! ✅",
+        parse_mode="HTML"
     )
 
 
@@ -953,8 +1096,37 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        file_id   = tg_file.file_id
-        unique_id = uuid.uuid4().hex[:16]
+        file_id = tg_file.file_id
+
+        # ── Caption ID Detection ──────────────────────────────────────────
+        caption_text = msg.caption or ""
+        detected_id  = extract_unique_id_from_caption(caption_text)
+
+        if detected_id and get_file(detected_id):
+            # Existing file — add new file_id as backup
+            unique_id = detected_id
+            add_file_id(unique_id, file_id)
+            deep_link = make_deep_link(unique_id)
+            try:
+                await ctx.bot.delete_message(msg.chat_id, msg.message_id)
+            except Exception:
+                pass
+            await processing.edit_text(
+                f"✅ <b>Backup Added!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📁 <b>{file_name}</b>\n"
+                f"🔗 <b>ID:</b> <code>{unique_id}</code>\n\n"
+                f"✅ New file_id added as backup!\n"
+                f"📦 Total backups: {len(get_file(unique_id).get('file_ids', [unique_id]))}",
+                parse_mode="HTML"
+            )
+            return
+        elif detected_id:
+            # Caption has ID but file doesn't exist yet — use that ID
+            unique_id = detected_id
+        else:
+            # No caption ID — generate new unique_id
+            unique_id = uuid.uuid4().hex[:16]
 
         # If storage channel configured — forward there for permanent file_id
         if STORAGE_CHANNEL_ID:
@@ -1021,6 +1193,62 @@ async def handle_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  BUILD APPLICATION
 # ─────────────────────────────────────────────
 
+async def handle_channel_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Auto-backup: detect files posted in channel with caption containing ID.
+    Works when bot is admin in backup channels.
+
+    Caption format:
+      ID: abc123def456
+      or
+      #abc123def456
+    """
+    msg = update.channel_post or update.message
+    if not msg:
+        return
+
+    tg_file   = None
+    file_type = "document"
+    file_name = ""
+    file_size = 0
+
+    if msg.video:
+        tg_file, file_type = msg.video, "video"
+        file_name = msg.video.file_name or f"video_{int(time.time())}.mp4"
+        file_size = msg.video.file_size or 0
+    elif msg.document:
+        tg_file, file_type = msg.document, "document"
+        file_name = msg.document.file_name or f"file_{int(time.time())}"
+        file_size = msg.document.file_size or 0
+    elif msg.audio:
+        tg_file, file_type = msg.audio, "audio"
+        file_name = msg.audio.file_name or f"audio_{int(time.time())}.mp3"
+        file_size = msg.audio.file_size or 0
+
+    if not tg_file:
+        return
+
+    caption_text = msg.caption or msg.text or ""
+    unique_id    = extract_unique_id_from_caption(caption_text)
+
+    if not unique_id:
+        logger.info(f"Channel file ignored — no ID in caption: {file_name}")
+        return
+
+    file_id  = tg_file.file_id
+    existing = get_file(unique_id)
+
+    if existing:
+        # Add as backup
+        add_file_id(unique_id, file_id)
+        total = len(get_file(unique_id).get("file_ids", [file_id]))
+        logger.info(f"✅ Channel backup added: {unique_id} | total backups: {total}")
+    else:
+        # New file from channel
+        save_file(unique_id, file_id, file_name, file_size, file_type)
+        logger.info(f"✅ New file from channel: {file_name} | {unique_id}")
+
+
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1034,6 +1262,7 @@ def build_application() -> Application:
     # Admin
     app.add_handler(CommandHandler("stats",          stats_cmd))
     app.add_handler(CommandHandler("files",          files_cmd))
+    app.add_handler(CommandHandler("backups",        backups_cmd))
     app.add_handler(CommandHandler("broadcast",      broadcast_cmd))
     app.add_handler(CommandHandler("approve",        approve_cmd))
     app.add_handler(CommandHandler("reject",         reject_cmd))
@@ -1048,6 +1277,12 @@ def build_application() -> Application:
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # Channel post handler — auto backup when file posted in channel
+    app.add_handler(MessageHandler(
+        filters.ChatType.CHANNEL & (filters.VIDEO | filters.Document.ALL | filters.AUDIO),
+        handle_channel_backup
+    ))
 
     return app
 
@@ -1123,7 +1358,7 @@ def main():
         resp = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
             json={"url": webhook_url, "drop_pending_updates": True,
-                  "allowed_updates": ["message", "callback_query"]},
+                  "allowed_updates": ["message", "callback_query", "channel_post"]},
             timeout=15
         )
         if resp.json().get("ok"):
